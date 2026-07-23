@@ -1,5 +1,4 @@
-<<<<<<< HEAD
-# gitler
+# gitler (In-progress)
 
 Fast, zero-configuration local file drops over mDNS and QUIC. Think terminal AirDrop for devices sharing one LAN.
 
@@ -89,6 +88,3 @@ cargo fmt --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --all-features --locked
 ```
-=======
-# gitler
->>>>>>> origin/main
