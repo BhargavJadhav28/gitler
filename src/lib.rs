@@ -55,12 +55,7 @@ pub async fn run() -> Result<()> {
         Command::Send { path, to, timeout } => {
             let peers = discover_peers(Duration::from_secs(timeout)).await?;
             let peer = select_peer(peers, to.as_deref())?;
-            println!(
-                "Sending {} to {} ({})",
-                path.display(),
-                peer.name,
-                peer.id
-            );
+            println!("Sending {} to {} ({})", path.display(), peer.name, peer.id);
             transfer::send_file(&path, &peer).await?;
         }
     }
@@ -92,8 +87,7 @@ fn select_peer(peers: Vec<Peer>, query: Option<&str>) -> Result<Peer> {
     if let Some(query) = query {
         let query = query.to_lowercase();
         let mut matches = peers.into_iter().filter(|peer| {
-            peer.name.to_lowercase().contains(&query)
-                || peer.id.to_lowercase().starts_with(&query)
+            peer.name.to_lowercase().contains(&query) || peer.id.to_lowercase().starts_with(&query)
         });
         let first = matches
             .next()

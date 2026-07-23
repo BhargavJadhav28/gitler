@@ -250,7 +250,35 @@ impl Drop for DaemonGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::instance_name;
+    use std::{collections::HashMap, net::SocketAddr};
+
+    use mdns_sd::{ResolvedService, ServiceInfo};
+
+    use super::{instance_name, parse_peer, SERVICE_TYPE};
+
+    fn resolved_service(
+        properties: HashMap<String, String>,
+        addresses: &str,
+    ) -> Result<ResolvedService, mdns_sd::Error> {
+        Ok(ServiceInfo::new(
+            SERVICE_TYPE,
+            "peer",
+            "peer.local.",
+            addresses,
+            4242,
+            properties,
+        )?
+        .as_resolved_service())
+    }
+
+    fn properties(fingerprint: [u8; 32]) -> HashMap<String, String> {
+        HashMap::from([
+            ("version".to_owned(), "1".to_owned()),
+            ("id".to_owned(), hex::encode(&fingerprint[..6])),
+            ("name".to_owned(), "workstation".to_owned()),
+            ("fingerprint".to_owned(), hex::encode(fingerprint)),
+        ])
+    }
 
     #[test]
     fn instance_name_should_remove_dns_hostile_characters() {
@@ -260,5 +288,51 @@ mod tests {
     #[test]
     fn instance_name_should_use_fallback_when_name_is_empty() {
         assert_eq!(instance_name("!!!", "abc123"), "gitler-abc123");
+    }
+
+    #[test]
+    fn parse_peer_should_accept_consistent_advertisement() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let fingerprint = [7_u8; 32];
+        let service = resolved_service(properties(fingerprint), "192.168.1.20")?;
+
+        let peer = parse_peer(&service).ok_or("valid peer was rejected")?;
+
+        assert_eq!(peer.id, hex::encode(&fingerprint[..6]));
+        assert_eq!(peer.name, "workstation");
+        assert_eq!(peer.address, "192.168.1.20:4242".parse::<SocketAddr>()?);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_peer_should_reject_fingerprint_id_mismatch() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut properties = properties([7_u8; 32]);
+        properties.insert("id".to_owned(), "different".to_owned());
+        let service = resolved_service(properties, "192.168.1.20")?;
+
+        assert!(parse_peer(&service).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn parse_peer_should_prefer_non_loopback_address() -> Result<(), Box<dyn std::error::Error>> {
+        let service = resolved_service(properties([7_u8; 32]), "127.0.0.1,192.168.1.20")?;
+
+        let peer = parse_peer(&service).ok_or("valid peer was rejected")?;
+
+        assert_eq!(peer.address, "192.168.1.20:4242".parse::<SocketAddr>()?);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_peer_should_reject_unsupported_protocol_version(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut properties = properties([7_u8; 32]);
+        properties.insert("version".to_owned(), "2".to_owned());
+        let service = resolved_service(properties, "192.168.1.20")?;
+
+        assert!(parse_peer(&service).is_none());
+        Ok(())
     }
 }

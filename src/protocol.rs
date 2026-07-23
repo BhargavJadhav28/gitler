@@ -47,10 +47,7 @@ pub(crate) enum ProtocolError {
     MessageTooLarge { actual: usize, maximum: usize },
 }
 
-pub(crate) async fn write_message<W, T>(
-    writer: &mut W,
-    value: &T,
-) -> Result<(), ProtocolError>
+pub(crate) async fn write_message<W, T>(writer: &mut W, value: &T) -> Result<(), ProtocolError>
 where
     W: AsyncWrite + Unpin,
     T: Serialize,
@@ -94,7 +91,11 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{read_message, write_message, TransferRequest, VERSION};
+    use tokio::io::AsyncWriteExt;
+
+    use super::{
+        read_message, write_message, ProtocolError, TransferRequest, MAX_MESSAGE_LENGTH, VERSION,
+    };
 
     #[tokio::test]
     async fn message_should_round_trip() -> Result<(), Box<dyn std::error::Error>> {
@@ -109,6 +110,67 @@ mod tests {
         let actual: TransferRequest = read_message(&mut reader).await?;
 
         assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_message_should_reject_oversized_declared_length(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (mut writer, mut reader) = tokio::io::duplex(4);
+        writer
+            .write_all(&((MAX_MESSAGE_LENGTH + 1) as u32).to_be_bytes())
+            .await?;
+
+        let error = read_message::<_, TransferRequest>(&mut reader)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ProtocolError::MessageTooLarge { .. }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_message_should_reject_truncated_payload() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (mut writer, mut reader) = tokio::io::duplex(32);
+        writer.write_all(&4_u32.to_be_bytes()).await?;
+        writer.write_all(b"{}\n").await?;
+        writer.shutdown().await?;
+
+        let error = read_message::<_, TransferRequest>(&mut reader)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ProtocolError::Io(_)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_message_should_reject_malformed_json() -> Result<(), Box<dyn std::error::Error>> {
+        let payload = b"not-json";
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        writer
+            .write_all(&(payload.len() as u32).to_be_bytes())
+            .await?;
+        writer.write_all(payload).await?;
+
+        let error = read_message::<_, TransferRequest>(&mut reader)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ProtocolError::Json(_)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_message_should_reject_oversized_serialized_payload(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let payload = "x".repeat(MAX_MESSAGE_LENGTH);
+        let (mut writer, _reader) = tokio::io::duplex(64);
+
+        let error = write_message(&mut writer, &payload).await.unwrap_err();
+
+        assert!(matches!(error, ProtocolError::MessageTooLarge { .. }));
         Ok(())
     }
 }

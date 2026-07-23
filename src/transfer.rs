@@ -13,7 +13,7 @@ use quinn::{Endpoint, Incoming};
 use sha2::{Digest, Sha256};
 use tokio::{
     fs::{self, File, OpenOptions},
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync::{Mutex, Semaphore},
     time::timeout,
 };
@@ -99,10 +99,7 @@ pub(crate) async fn receive_files(
         .await
         .with_context(|| format!("failed to create {}", output.display()))?;
     let identity = Identity::generate()?;
-    let endpoint = Endpoint::server(
-        identity.server_config,
-        SocketAddrV4::new(bind, port).into(),
-    )?;
+    let endpoint = Endpoint::server(identity.server_config, SocketAddrV4::new(bind, port).into())?;
     let local_address = endpoint.local_addr()?;
     let mut advertisement =
         Advertisement::publish(&name, local_address.port(), identity.fingerprint, bind)?;
@@ -182,12 +179,10 @@ pub(crate) async fn receive_files(
     Ok(())
 }
 
-async fn stream_file(
-    path: &Path,
-    size: u64,
-    send: &mut quinn::SendStream,
-    progress: &ProgressBar,
-) -> Result<()> {
+async fn stream_file<W>(path: &Path, size: u64, send: &mut W, progress: &ProgressBar) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
     let mut file = File::open(path).await?;
     let mut remaining = size;
     let mut buffer = vec![0_u8; CHUNK_SIZE];
@@ -279,32 +274,28 @@ async fn handle_connection(
     if let Err(error) = receive_result {
         bar.finish_and_clear();
         let _ = fs::remove_file(&destination).await;
-        let _ = write_message(
-            &mut send,
-            &TransferResponse::rejected(error.to_string()),
-        )
-        .await;
+        let _ = write_message(&mut send, &TransferResponse::rejected(error.to_string())).await;
         let _ = send.finish();
         return Err(error);
     }
 
-    write_message(
-        &mut send,
-        &TransferResponse::accepted("integrity verified"),
-    )
-    .await?;
+    write_message(&mut send, &TransferResponse::accepted("integrity verified")).await?;
     send.finish()?;
     bar.finish_with_message(format!("received {}", destination.display()));
     println!("Received {}", destination.display());
+    connection.closed().await;
     Ok(())
 }
 
-async fn receive_body(
-    receive: &mut quinn::RecvStream,
+async fn receive_body<R>(
+    receive: &mut R,
     file: &mut File,
     size: u64,
     progress: &ProgressBar,
-) -> Result<()> {
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+{
     let mut remaining = size;
     let mut buffer = vec![0_u8; CHUNK_SIZE];
     let mut hasher = Sha256::new();
@@ -353,7 +344,10 @@ async fn request_approval(
         io::stdout().flush()?;
         let mut answer = String::new();
         io::stdin().read_line(&mut answer)?;
-        Ok(matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+        Ok(matches!(
+            answer.trim().to_ascii_lowercase().as_str(),
+            "y" | "yes"
+        ))
     })
     .await
     .context("receiver approval task failed")?
@@ -382,15 +376,12 @@ fn validate_file_name(file_name: &str) -> Result<()> {
     if file_name.chars().any(char::is_control) {
         bail!("file name contains control characters");
     }
-    if file_name
-        .chars()
-        .any(|character| {
-            matches!(
-                character,
-                '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'
-            )
-        })
-        || file_name.ends_with(' ')
+    if file_name.chars().any(|character| {
+        matches!(
+            character,
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'
+        )
+    }) || file_name.ends_with(' ')
         || file_name.ends_with('.')
     {
         bail!("file name contains a reserved character or suffix");
@@ -417,10 +408,7 @@ fn is_reserved_windows_name(file_name: &str) -> bool {
             .strip_prefix("COM")
             .or_else(|| base.strip_prefix("LPT"))
             .is_some_and(|number| {
-                matches!(
-                    number,
-                    "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"
-                )
+                matches!(number, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
             })
 }
 
@@ -473,7 +461,50 @@ fn transfer_progress(length: u64, message: String) -> Result<ProgressBar> {
 
 #[cfg(test)]
 mod tests {
-    use super::{collision_name, create_destination, validate_file_name};
+    use std::{
+        collections::HashSet,
+        net::{Ipv4Addr, SocketAddrV4},
+        path::PathBuf,
+        sync::Arc,
+        time::Duration,
+    };
+
+    use sha2::{Digest, Sha256};
+    use tokio::{io::AsyncWriteExt, task::JoinSet, time::timeout};
+
+    use crate::{discovery::Peer, security::Identity};
+
+    use super::{
+        collision_name, create_destination, handle_connection, receive_body, send_file,
+        stream_file, validate_file_name, validate_request, CHUNK_SIZE,
+    };
+
+    async fn receive_payload(payload: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let destination = directory.path().join("received.bin");
+        let (mut writer, mut reader) = tokio::io::duplex(CHUNK_SIZE * 2);
+        let payload = payload.to_vec();
+        let size = payload.len() as u64;
+        let sender = tokio::spawn(async move {
+            let digest: [u8; 32] = Sha256::digest(&payload).into();
+            writer.write_all(&payload).await?;
+            writer.write_all(&digest).await?;
+            writer.shutdown().await
+        });
+        let mut file = tokio::fs::File::create(&destination).await?;
+
+        receive_body(
+            &mut reader,
+            &mut file,
+            size,
+            &indicatif::ProgressBar::hidden(),
+        )
+        .await?;
+        sender.await??;
+        drop(file);
+
+        Ok(tokio::fs::read(destination).await?)
+    }
 
     #[test]
     fn file_name_should_reject_parent_path() {
@@ -490,6 +521,33 @@ mod tests {
         assert_eq!(collision_name("archive.tar", 2), "archive (2).tar");
     }
 
+    #[test]
+    fn validate_file_name_should_reject_reserved_windows_names() {
+        assert!(validate_file_name("con.txt").is_err());
+    }
+
+    #[test]
+    fn validate_request_should_accept_size_at_limit() {
+        let request = crate::protocol::TransferRequest {
+            version: crate::protocol::VERSION,
+            file_name: "notes.txt".to_owned(),
+            size: 42,
+        };
+
+        assert!(validate_request(&request, 42).is_ok());
+    }
+
+    #[test]
+    fn validate_request_should_reject_size_over_limit() {
+        let request = crate::protocol::TransferRequest {
+            version: crate::protocol::VERSION,
+            file_name: "notes.txt".to_owned(),
+            size: 43,
+        };
+
+        assert!(validate_request(&request, 42).is_err());
+    }
+
     #[tokio::test]
     async fn destination_should_not_overwrite_existing_file(
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -499,6 +557,155 @@ mod tests {
         let (_file, destination) = create_destination(directory.path(), "notes.txt").await?;
 
         assert_eq!(destination, directory.path().join("notes (1).txt"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_destination_should_reserve_unique_names_concurrently(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let mut tasks = JoinSet::new();
+        for _ in 0..8 {
+            let output = directory.path().to_path_buf();
+            tasks.spawn(async move {
+                let (file, path) = create_destination(&output, "shared.txt").await?;
+                drop(file);
+                Ok::<PathBuf, std::io::Error>(path)
+            });
+        }
+
+        let mut paths = HashSet::new();
+        while let Some(path) = tasks.join_next().await {
+            paths.insert(path??);
+        }
+
+        assert_eq!(paths.len(), 8);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn receive_body_should_preserve_empty_file() -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(receive_payload(&[]).await?, Vec::<u8>::new());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn receive_body_should_preserve_chunk_boundary_file(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let payload = vec![9_u8; CHUNK_SIZE];
+
+        assert_eq!(receive_payload(&payload).await?, payload);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn receive_body_should_preserve_multi_chunk_file(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let payload: Vec<u8> = (0..(CHUNK_SIZE * 2 + 1))
+            .map(|index| (index % 251) as u8)
+            .collect();
+
+        assert_eq!(receive_payload(&payload).await?, payload);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn receive_body_should_reject_invalid_digest() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let destination = directory.path().join("received.bin");
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+        writer.write_all(b"data").await?;
+        writer.write_all(&[0_u8; 32]).await?;
+        writer.shutdown().await?;
+        let mut file = tokio::fs::File::create(destination).await?;
+
+        let error = receive_body(&mut reader, &mut file, 4, &indicatif::ProgressBar::hidden())
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("digest mismatch"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stream_file_should_reject_source_smaller_than_declared_size(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let source = directory.path().join("source.bin");
+        tokio::fs::write(&source, b"x").await?;
+        let (mut writer, _reader) = tokio::io::duplex(1024);
+
+        let error = stream_file(&source, 2, &mut writer, &indicatif::ProgressBar::hidden())
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("reached end"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stream_file_should_reject_source_larger_than_declared_size(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let source = directory.path().join("source.bin");
+        tokio::fs::write(&source, b"xy").await?;
+        let (mut writer, _reader) = tokio::io::duplex(1024);
+
+        let error = stream_file(&source, 1, &mut writer, &indicatif::ProgressBar::hidden())
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("grew beyond"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn quic_transfer_should_pin_identity_and_preserve_multi_chunk_file(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let source_directory = tempfile::tempdir()?;
+        let output_directory = tempfile::tempdir()?;
+        let source = source_directory.path().join("payload.bin");
+        let payload: Vec<u8> = (0..(CHUNK_SIZE * 2 + 1))
+            .map(|index| (index % 251) as u8)
+            .collect();
+        tokio::fs::write(&source, &payload).await?;
+
+        let identity = Identity::generate()?;
+        let fingerprint = identity.fingerprint;
+        let endpoint = quinn::Endpoint::server(
+            identity.server_config,
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into(),
+        )?;
+        let peer = Peer {
+            id: "loopback".to_owned(),
+            name: "loopback".to_owned(),
+            address: endpoint.local_addr()?,
+            fingerprint,
+        };
+        let output = output_directory.path().to_path_buf();
+        let server = tokio::spawn(async move {
+            let incoming = endpoint
+                .accept()
+                .await
+                .ok_or_else(|| anyhow::anyhow!("receiver endpoint closed"))?;
+            handle_connection(
+                incoming,
+                &output,
+                u64::MAX,
+                true,
+                &Arc::new(indicatif::MultiProgress::new()),
+                &Arc::new(tokio::sync::Mutex::new(())),
+            )
+            .await
+        });
+
+        timeout(Duration::from_secs(10), send_file(&source, &peer)).await??;
+        timeout(Duration::from_secs(10), server).await???;
+
+        assert_eq!(
+            tokio::fs::read(output_directory.path().join("payload.bin")).await?,
+            payload
+        );
         Ok(())
     }
 }

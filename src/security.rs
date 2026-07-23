@@ -62,8 +62,8 @@ pub(crate) fn pinned_client_config(
         .with_no_client_auth();
     tls.alpn_protocols = vec![ALPN.to_vec()];
 
-    let crypto = QuicClientConfig::try_from(tls)
-        .map_err(|error| SecurityError::Quic(error.to_string()))?;
+    let crypto =
+        QuicClientConfig::try_from(tls).map_err(|error| SecurityError::Quic(error.to_string()))?;
     Ok(quinn::ClientConfig::new(Arc::new(crypto)))
 }
 
@@ -82,6 +82,20 @@ impl FingerprintVerifier {
     }
 }
 
+fn verify_fingerprint(
+    certificate: &CertificateDer<'_>,
+    expected: [u8; 32],
+) -> Result<(), rustls::Error> {
+    let actual: [u8; 32] = Sha256::digest(certificate.as_ref()).into();
+    if actual != expected {
+        return Err(rustls::Error::General(
+            "receiver certificate fingerprint does not match mDNS advertisement".to_owned(),
+        ));
+    }
+
+    Ok(())
+}
+
 impl ServerCertVerifier for FingerprintVerifier {
     fn verify_server_cert(
         &self,
@@ -91,13 +105,7 @@ impl ServerCertVerifier for FingerprintVerifier {
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        let actual: [u8; 32] = Sha256::digest(end_entity.as_ref()).into();
-        if actual != self.expected {
-            return Err(rustls::Error::General(
-                "receiver certificate fingerprint does not match mDNS advertisement".to_owned(),
-            ));
-        }
-
+        verify_fingerprint(end_entity, self.expected)?;
         Ok(ServerCertVerified::assertion())
     }
 
@@ -133,5 +141,44 @@ impl ServerCertVerifier for FingerprintVerifier {
         self.provider
             .signature_verification_algorithms
             .supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rustls::pki_types::CertificateDer;
+    use sha2::{Digest, Sha256};
+
+    use super::verify_fingerprint;
+
+    fn certificate() -> Result<CertificateDer<'static>, rcgen::Error> {
+        let rcgen::CertifiedKey { cert, .. } =
+            rcgen::generate_simple_self_signed(vec!["gitler.local".to_owned()])?;
+        Ok(CertificateDer::from(cert))
+    }
+
+    #[test]
+    fn verify_fingerprint_should_accept_matching_certificate(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let certificate = certificate()?;
+        let fingerprint: [u8; 32] = Sha256::digest(certificate.as_ref()).into();
+
+        verify_fingerprint(&certificate, fingerprint)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn verify_fingerprint_should_reject_mismatch() -> Result<(), Box<dyn std::error::Error>> {
+        let certificate = certificate()?;
+        let mut fingerprint: [u8; 32] = Sha256::digest(certificate.as_ref()).into();
+        fingerprint[0] ^= 1;
+
+        let error = verify_fingerprint(&certificate, fingerprint).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("receiver certificate fingerprint does not match mDNS advertisement"));
+        Ok(())
     }
 }
