@@ -254,6 +254,8 @@ mod tests {
 
     use mdns_sd::{ResolvedService, ServiceInfo};
 
+    use crate::protocol::VERSION;
+
     use super::{instance_name, parse_peer, SERVICE_TYPE};
 
     fn resolved_service(
@@ -273,7 +275,7 @@ mod tests {
 
     fn properties(fingerprint: [u8; 32]) -> HashMap<String, String> {
         HashMap::from([
-            ("version".to_owned(), "1".to_owned()),
+            ("version".to_owned(), VERSION.to_string()),
             ("id".to_owned(), hex::encode(&fingerprint[..6])),
             ("name".to_owned(), "workstation".to_owned()),
             ("fingerprint".to_owned(), hex::encode(fingerprint)),
@@ -329,7 +331,7 @@ mod tests {
     fn parse_peer_should_reject_unsupported_protocol_version(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut properties = properties([7_u8; 32]);
-        properties.insert("version".to_owned(), "2".to_owned());
+        properties.insert("version".to_owned(), VERSION.wrapping_add(1).to_string());
         let service = resolved_service(properties, "192.168.1.20")?;
 
         assert!(parse_peer(&service).is_none());

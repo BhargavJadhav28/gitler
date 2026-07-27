@@ -39,11 +39,11 @@ sequenceDiagram
     S->>R: TransferRequest
     R->>R: Validate limits and request user approval
     R-->>S: Accepted or rejected
-    S->>R: Exact file bytes then SHA-256 digest
-    R-->>S: Integrity result
+    S->>R: One stream per manifest file: bytes then SHA-256 digest
+    R-->>S: Per-file integrity result
 ```
 
-Control messages use big-endian `u32` length followed by JSON, capped at 16 KiB. File body streams directly and is bounded by declared `u64` size. Digest trailer is 32 raw bytes.
+Control messages use big-endian `u32` length followed by JSON, capped at 16 KiB. `TransferRequest` carries a file manifest; each file uses a separate bidirectional QUIC stream identified by its manifest index. File bodies stream directly and are bounded by declared `u64` size. Digest trailers are 32 raw bytes.
 
 ## Security decisions
 
@@ -60,10 +60,9 @@ Recommended next security milestone:
 ## Planned evolution
 
 1. IPv6 scoped-address support.
-2. Multiple files and directory manifests, one QUIC stream per file.
-3. Resumable chunks with content-addressed verification.
-4. Persistent trusted peers and configurable approval policy.
-5. Core API extracted behind event channels for `egui` or Tauri.
-6. Benchmarks for chunk size, stream parallelism, and UDP buffer tuning.
+2. Resumable chunks with content-addressed verification.
+3. Persistent trusted peers and configurable approval policy.
+4. Core API extracted behind event channels for `egui` or Tauri.
+5. Benchmarks for chunk size, stream parallelism, and UDP buffer tuning.
 
 Avoid transport trait abstraction until second transport exists. Quinn stays concrete now; protocol and discovery boundaries already isolate likely change points without premature dynamic dispatch.

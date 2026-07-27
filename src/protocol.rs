@@ -1,16 +1,26 @@
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub(crate) const VERSION: u16 = 1;
-pub(crate) const ALPN: &[u8] = b"gitler/1";
+pub(crate) const VERSION: u16 = 2;
+pub(crate) const ALPN: &[u8] = b"gitler/2";
 pub(crate) const DIGEST_LENGTH: usize = 32;
 const MAX_MESSAGE_LENGTH: usize = 16 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TransferRequest {
     pub(crate) version: u16,
-    pub(crate) file_name: String,
+    pub(crate) files: Vec<ManifestEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ManifestEntry {
+    pub(crate) path: String,
     pub(crate) size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct FileRequest {
+    pub(crate) index: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,15 +104,18 @@ mod tests {
     use tokio::io::AsyncWriteExt;
 
     use super::{
-        read_message, write_message, ProtocolError, TransferRequest, MAX_MESSAGE_LENGTH, VERSION,
+        read_message, write_message, ManifestEntry, ProtocolError, TransferRequest,
+        MAX_MESSAGE_LENGTH, VERSION,
     };
 
     #[tokio::test]
     async fn message_should_round_trip() -> Result<(), Box<dyn std::error::Error>> {
         let expected = TransferRequest {
             version: VERSION,
-            file_name: "notes.txt".to_owned(),
-            size: 42,
+            files: vec![ManifestEntry {
+                path: "notes.txt".to_owned(),
+                size: 42,
+            }],
         };
         let (mut writer, mut reader) = tokio::io::duplex(1024);
 

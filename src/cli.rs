@@ -1,6 +1,9 @@
 use std::{net::Ipv4Addr, path::PathBuf};
 
-use clap::{ArgAction, Parser, Subcommand};
+use clap::{
+    builder::styling::{AnsiColor, Effects, Styles},
+    ArgAction, Parser, Subcommand,
+};
 
 const DEFAULT_MAX_SIZE: u64 = 10 * 1024 * 1024 * 1024;
 
@@ -8,7 +11,13 @@ const DEFAULT_MAX_SIZE: u64 = 10 * 1024 * 1024 * 1024;
 #[command(
     name = "gitler",
     version,
-    about = "Fast local file drops over mDNS and QUIC"
+    about = "Fast, private file drops on your local network",
+    after_help = "Examples:\n  gitler receive --output ./Downloads\n  gitler send ./report.pdf --to workstation\n  gitler peers\n\nTransfers use encrypted QUIC. Review receiver identity before sending sensitive files.",
+    styles = Styles::styled()
+        .header(AnsiColor::Cyan.on_default() | Effects::BOLD)
+        .usage(AnsiColor::Cyan.on_default() | Effects::BOLD)
+        .literal(AnsiColor::Green.on_default())
+        .placeholder(AnsiColor::Yellow.on_default())
 )]
 pub(crate) struct Cli {
     /// Increase diagnostic logging. Repeat for debug output.
@@ -46,7 +55,7 @@ pub(crate) enum Command {
         #[arg(long, default_value_t = DEFAULT_MAX_SIZE)]
         max_size: u64,
 
-        /// Accept valid transfers without an interactive confirmation.
+        /// Accept valid transfers without confirmation. Use only on a trusted network.
         #[arg(long)]
         accept_all: bool,
 
@@ -59,10 +68,11 @@ pub(crate) enum Command {
         port: u16,
     },
 
-    /// Send one file to a discovered receiver.
+    /// Send files and directories to a discovered receiver.
     Send {
-        /// File to send.
-        path: PathBuf,
+        /// Files or directories to send.
+        #[arg(required = true, num_args = 1..)]
+        paths: Vec<PathBuf>,
 
         /// Receiver name or peer ID. Prompts when omitted and several peers exist.
         #[arg(short, long)]

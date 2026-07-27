@@ -17,8 +17,9 @@ CLI gives fastest path to a reliable protocol, works over SSH and on headless de
 - Collision-safe destination naming; existing files are never overwritten
 - Interactive receiver approval by default
 - 10 GiB default per-file limit, configurable with `--max-size`
+- Multiple files and recursive directory transfers, with one QUIC stream per file
 
-IPv4 carries file transfers in this first slice. mDNS still observes all interfaces. IPv6 transport, multiple-file batches, trusted device identities, and GUI are planned extensions.
+IPv4 carries file transfers in this first slice. mDNS still observes all interfaces. IPv6 transport, resumable transfers, trusted device identities, and GUI are planned extensions.
 
 ## Install
 
@@ -50,10 +51,10 @@ Discover receivers:
 gitler peers
 ```
 
-Send file:
+Send files and directories:
 
 ```sh
-gitler send ./report.pdf
+gitler send ./report.pdf ./photos
 ```
 
 Choose receiver non-interactively:
@@ -82,9 +83,142 @@ See [`docs/architecture.md`](docs/architecture.md).
 
 ## Development
 
+### Prerequisites
+
+- [Rust](https://rustup.rs/) **1.88** or newer (see `rust-toolchain.toml`)
+- `rustfmt` and `clippy` components (installed automatically by the toolchain file when using rustup)
+
 ```sh
-cargo generate-lockfile
+rustup show
+rustc --version
+cargo --version
+```
+
+### Setup
+
+```sh
+git clone <repo-url>
+cd gitler
+cargo generate-lockfile   # only needed if Cargo.lock is missing
+```
+
+### Build
+
+```sh
+# Debug build
+cargo build --locked
+
+# With all features (same as CI-style checks)
+cargo build --all-features --locked
+
+# Optimized release build (thin LTO, stripped)
+cargo build --release --locked
+```
+
+Binaries land at:
+
+| Profile | Unix | Windows |
+| ------- | ---- | ------- |
+| Debug   | `target/debug/gitler` | `target/debug/gitler.exe` |
+| Release | `target/release/gitler` | `target/release/gitler.exe` |
+
+### Run locally
+
+Use `cargo run` during development (rebuilds as needed):
+
+```sh
+# Help
+cargo run -- --help
+cargo run -- receive --help
+cargo run -- send --help
+cargo run -- peers --help
+
+# Discover receivers (default 3s scan)
+cargo run -- peers
+cargo run -- peers --timeout 5
+
+# Receive into ./Downloads (interactive approval)
+cargo run -- receive --output ./Downloads
+
+# Unattended receive (trusted LAN only)
+cargo run -- receive --output ./Downloads --accept-all
+
+# Receive one transfer then exit
+cargo run -- receive --once --output ./Downloads
+
+# Send files or directories (interactive peer pick if several exist)
+cargo run -- send ./test.txt ./photos
+
+# Send to a named receiver
+cargo run -- send ./test.txt ./photos --to workstation
+
+# Extra diagnostics (-v or -vv)
+cargo run -- -vv peers
+```
+
+After a build, run the binary directly:
+
+```sh
+./target/debug/gitler peers          # Unix
+.\target\debug\gitler.exe peers      # Windows
+```
+
+### Test
+
+```sh
+# Full test suite
+cargo test --all-features --locked
+
+# Single test by name filter
+cargo test --all-features --locked <test_name>
+
+# Show println! / test output
+cargo test --all-features --locked -- --nocapture
+```
+
+### Format and lint
+
+```sh
+# Apply formatting
+cargo fmt
+
+# Check formatting only (CI style)
+cargo fmt --check
+
+# Clippy with warnings as errors
+cargo clippy --all-targets --all-features --locked -- -D warnings
+```
+
+### Full validation script
+
+`check.sh` runs format check, Clippy, tests, build, and `--help` in one pass:
+
+```sh
+# Unix / Git Bash / WSL
+./check.sh
+
+# Or
+bash check.sh
+```
+
+Equivalent manual sequence:
+
+```sh
 cargo fmt --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --all-features --locked
+cargo build --all-features --locked
+```
+
+### Install from source
+
+```sh
+cargo install --path .
+# then: gitler --help
+```
+
+### Clean
+
+```sh
+cargo clean
 ```

@@ -6,6 +6,7 @@ mod discovery;
 mod protocol;
 mod security;
 mod transfer;
+mod ui;
 
 use std::{
     io::{self, IsTerminal, Write},
@@ -29,8 +30,10 @@ pub async fn run() -> Result<()> {
 
     match cli.command {
         Command::Peers { timeout } => {
-            let peers = discover_peers(Duration::from_secs(timeout)).await?;
-            print_peers(&peers);
+            let duration = Duration::from_secs(timeout);
+            ui::print_discovery_start(duration);
+            let peers = discover_peers(duration).await?;
+            ui::print_peers(&peers);
         }
         Command::Receive {
             output,
@@ -52,11 +55,12 @@ pub async fn run() -> Result<()> {
             )
             .await?;
         }
-        Command::Send { path, to, timeout } => {
-            let peers = discover_peers(Duration::from_secs(timeout)).await?;
+        Command::Send { paths, to, timeout } => {
+            let duration = Duration::from_secs(timeout);
+            ui::print_discovery_start(duration);
+            let peers = discover_peers(duration).await?;
             let peer = select_peer(peers, to.as_deref())?;
-            println!("Sending {} to {} ({})", path.display(), peer.name, peer.id);
-            transfer::send_file(&path, &peer).await?;
+            transfer::send_files(&paths, &peer).await?;
         }
     }
 
@@ -106,21 +110,21 @@ fn select_peer(peers: Vec<Peer>, query: Option<&str>) -> Result<Peer> {
     }
 
     if !io::stdin().is_terminal() {
-        print_peers(&peers);
+        ui::print_peers(&peers);
         bail!("several receivers found; select one with `--to NAME_OR_ID`");
     }
 
-    println!("Receivers:");
+    println!("\nChoose a receiver:\n");
     for (index, peer) in peers.iter().enumerate() {
         println!(
-            "  {}) {} [{}] at {}",
+            "  {}) {:<24} [{}]  {}",
             index + 1,
             peer.name,
             peer.id,
             peer.address
         );
     }
-    print!("Select receiver: ");
+    print!("\nReceiver number: ");
     io::stdout().flush()?;
 
     let mut input = String::new();
@@ -134,15 +138,4 @@ fn select_peer(peers: Vec<Peer>, query: Option<&str>) -> Result<Peer> {
         .into_iter()
         .nth(selected - 1)
         .context("selected receiver disappeared")
-}
-
-fn print_peers(peers: &[Peer]) {
-    if peers.is_empty() {
-        println!("No receivers found");
-        return;
-    }
-
-    for peer in peers {
-        println!("{}\t{}\t{}", peer.id, peer.name, peer.address);
-    }
 }

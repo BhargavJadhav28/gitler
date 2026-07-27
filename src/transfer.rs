@@ -22,9 +22,11 @@ use tracing::{info, warn};
 use crate::{
     discovery::{Advertisement, Peer},
     protocol::{
-        read_message, write_message, TransferRequest, TransferResponse, DIGEST_LENGTH, VERSION,
+        read_message, write_message, FileRequest, ManifestEntry, TransferRequest, TransferResponse,
+        DIGEST_LENGTH, VERSION,
     },
     security::{pinned_client_config, Identity},
+    ui::{format_bytes, plural_suffix, print_receiver_ready},
 };
 
 const CHUNK_SIZE: usize = 128 * 1024;
@@ -32,25 +34,33 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
 const CHUNK_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_ACTIVE_TRANSFERS: usize = 8;
 
-pub(crate) async fn send_file(path: &Path, peer: &Peer) -> Result<()> {
-    let metadata = fs::metadata(path)
-        .await
-        .with_context(|| format!("failed to inspect {}", path.display()))?;
-    if !metadata.is_file() {
-        bail!("{} is not a regular file", path.display());
-    }
-
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .ok_or_else(|| anyhow!("file name must be valid UTF-8"))?
-        .to_owned();
+pub(crate) async fn send_files(paths: &[PathBuf], peer: &Peer) -> Result<()> {
+    let files = collect_files(paths).await?;
+    let total_size = files.iter().try_fold(0_u64, |total, file| {
+        total
+            .checked_add(file.size)
+            .ok_or_else(|| anyhow!("selected files exceed supported total size"))
+    })?;
     let request = TransferRequest {
         version: VERSION,
-        file_name: file_name.clone(),
-        size: metadata.len(),
+        files: files
+            .iter()
+            .map(|file| ManifestEntry {
+                path: file.relative_path.clone(),
+                size: file.size,
+            })
+            .collect(),
     };
+
+    println!(
+        "Preparing {} file{} ({}) for {} [{}]",
+        files.len(),
+        plural_suffix(files.len()),
+        format_bytes(total_size),
+        peer.name,
+        peer.id
+    );
+    println!("Connecting to {}...", peer.address);
 
     let mut endpoint = Endpoint::client(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into())?;
     endpoint.set_default_client_config(pinned_client_config(peer.fingerprint)?);
@@ -58,32 +68,145 @@ pub(crate) async fn send_file(path: &Path, peer: &Peer) -> Result<()> {
         .connect(peer.address, "gitler.local")?
         .await
         .with_context(|| format!("failed to connect to {} at {}", peer.name, peer.address))?;
-    let (mut send, mut receive) = connection.open_bi().await?;
+    let (mut control_send, mut control_receive) = connection.open_bi().await?;
+    write_message(&mut control_send, &request).await?;
+    control_send.finish()?;
 
-    write_message(&mut send, &request).await?;
-    let response: TransferResponse = read_message(&mut receive).await?;
+    let response: TransferResponse = read_message(&mut control_receive).await?;
     if !response.accepted {
         bail!("receiver rejected transfer: {}", response.message);
     }
+    println!("Receiver accepted transfer. Sending files...");
 
-    let progress = transfer_progress(metadata.len(), format!("sending {file_name}"))?;
-    let result = stream_file(path, metadata.len(), &mut send, &progress).await;
-    if result.is_err() {
-        progress.finish_and_clear();
+    for (index, file) in files.iter().enumerate() {
+        let (mut send, mut receive) = connection.open_bi().await?;
+        write_message(&mut send, &FileRequest { index }).await?;
+        let progress = transfer_progress(file.size, format!("sending {}", file.relative_path))?;
+        let result = stream_file(&file.source_path, file.size, &mut send, &progress).await;
+        if result.is_err() {
+            progress.finish_and_clear();
+        }
+        result?;
+        send.finish()?;
+
+        let response: TransferResponse = read_message(&mut receive).await?;
+        if !response.accepted {
+            progress.finish_and_clear();
+            bail!(
+                "receiver rejected {}: {}",
+                file.relative_path,
+                response.message
+            );
+        }
+        progress.finish_with_message(format!("sent {}", file.relative_path));
     }
-    result?;
-    send.finish()?;
 
-    let response: TransferResponse = read_message(&mut receive).await?;
-    if !response.accepted {
-        progress.finish_and_clear();
-        bail!("receiver rejected file: {}", response.message);
-    }
-
-    progress.finish_with_message(format!("sent {file_name}"));
     connection.close(0_u32.into(), b"transfer complete");
     endpoint.wait_idle().await;
+    println!(
+        "Transfer complete: {} file{} sent.",
+        files.len(),
+        plural_suffix(files.len())
+    );
     Ok(())
+}
+
+struct SendFile {
+    source_path: PathBuf,
+    relative_path: String,
+    size: u64,
+}
+
+async fn collect_files(paths: &[PathBuf]) -> Result<Vec<SendFile>> {
+    if paths.is_empty() {
+        bail!("at least one file or directory is required");
+    }
+
+    let mut files = Vec::new();
+    for path in paths {
+        let metadata = fs::metadata(path)
+            .await
+            .with_context(|| format!("failed to inspect {}", path.display()))?;
+        if metadata.is_file() {
+            let relative_path = path_file_name(path)?;
+            files.push(SendFile {
+                source_path: path.clone(),
+                relative_path,
+                size: metadata.len(),
+            });
+        } else if metadata.is_dir() {
+            let root = path_file_name(path)?;
+            collect_directory_files(path, Path::new(&root), &mut files).await?;
+        } else {
+            bail!("{} is not a regular file or directory", path.display());
+        }
+    }
+
+    if files.is_empty() {
+        bail!("selected directories contain no files");
+    }
+    let mut paths = std::collections::HashSet::new();
+    for file in &files {
+        if !paths.insert(file.relative_path.clone()) {
+            bail!(
+                "selected inputs contain duplicate path `{}`",
+                file.relative_path
+            );
+        }
+    }
+    Ok(files)
+}
+
+async fn collect_directory_files(
+    directory: &Path,
+    relative_directory: &Path,
+    files: &mut Vec<SendFile>,
+) -> Result<()> {
+    let mut entries = fs::read_dir(directory)
+        .await
+        .with_context(|| format!("failed to read {}", directory.display()))?;
+    while let Some(entry) = entries.next_entry().await? {
+        let source_path = entry.path();
+        let relative_path = relative_directory.join(entry.file_name());
+        let metadata = entry.metadata().await?;
+        if metadata.is_file() {
+            files.push(SendFile {
+                relative_path: manifest_path(&relative_path)?,
+                source_path,
+                size: metadata.len(),
+            });
+        } else if metadata.is_dir() {
+            Box::pin(collect_directory_files(&source_path, &relative_path, files)).await?;
+        }
+    }
+    Ok(())
+}
+
+fn path_file_name(path: &Path) -> Result<String> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| anyhow!("path name must be valid UTF-8"))?;
+    Ok(name.to_owned())
+}
+
+fn manifest_path(path: &Path) -> Result<String> {
+    let mut parts = Vec::new();
+    for component in path.components() {
+        let Component::Normal(part) = component else {
+            bail!("transfer path must contain only normal path components");
+        };
+        let part = part
+            .to_str()
+            .ok_or_else(|| anyhow!("transfer path must be valid UTF-8"))?;
+        validate_file_name(part)?;
+        parts.push(part);
+    }
+    if parts.is_empty() {
+        bail!("transfer path must not be empty");
+    }
+    Ok(parts.join("/"))
 }
 
 pub(crate) async fn receive_files(
@@ -106,11 +229,19 @@ pub(crate) async fn receive_files(
     let progress = Arc::new(MultiProgress::new());
     let approval_lock = Arc::new(Mutex::new(()));
 
-    println!(
-        "Receiving as {name} into {} on UDP port {}",
-        output.display(),
-        local_address.port()
+    print_receiver_ready(
+        &name,
+        &output,
+        local_address.port(),
+        once,
+        max_size,
+        accept_all,
     );
+    if !accept_all && !io::stdin().is_terminal() {
+        eprintln!(
+            "warning: interactive approval needs a terminal; incoming transfers will be rejected.\n         Use --accept-all only on a trusted network."
+        );
+    }
 
     if once {
         let incoming = endpoint
@@ -225,64 +356,105 @@ async fn handle_connection(
     let connection = incoming.await?;
     let remote = connection.remote_address();
     info!(%remote, "QUIC connection established");
-    let (mut send, mut receive) = timeout(CONTROL_TIMEOUT, connection.accept_bi())
+    let (mut control_send, mut control_receive) = timeout(CONTROL_TIMEOUT, connection.accept_bi())
         .await
         .context("sender did not open a transfer stream in time")??;
-    let request: TransferRequest = timeout(CONTROL_TIMEOUT, read_message(&mut receive))
+    let request: TransferRequest = timeout(CONTROL_TIMEOUT, read_message(&mut control_receive))
         .await
         .context("sender did not provide transfer metadata in time")??;
 
     if let Err(error) = validate_request(&request, max_size) {
-        write_message(&mut send, &TransferResponse::rejected(error.to_string())).await?;
-        send.finish()?;
+        write_message(
+            &mut control_send,
+            &TransferResponse::rejected(error.to_string()),
+        )
+        .await?;
+        control_send.finish()?;
         return Err(error);
     }
 
-    if !accept_all && !request_approval(remote, request.clone(), approval_lock).await? {
-        let error = anyhow!("transfer was not approved");
-        write_message(&mut send, &TransferResponse::rejected(error.to_string())).await?;
-        send.finish()?;
+    if !accept_all && !io::stdin().is_terminal() {
+        let error = anyhow!(
+            "receiver requires interactive approval, but standard input is not a terminal; rerun in a terminal or use --accept-all only on a trusted network"
+        );
+        write_message(
+            &mut control_send,
+            &TransferResponse::rejected(error.to_string()),
+        )
+        .await?;
+        control_send.finish()?;
         return Err(error);
     }
 
-    let (mut file, destination) = match create_destination(output, &request.file_name).await {
-        Ok(destination) => destination,
-        Err(error) => {
-            write_message(
-                &mut send,
-                &TransferResponse::rejected(format!("cannot create destination: {error}")),
-            )
-            .await?;
-            send.finish()?;
-            return Err(error.into());
-        }
-    };
+    if !accept_all && !request_approval(remote, &request, approval_lock).await? {
+        let error = anyhow!("transfer was declined by receiver");
+        write_message(
+            &mut control_send,
+            &TransferResponse::rejected(error.to_string()),
+        )
+        .await?;
+        control_send.finish()?;
+        return Err(error);
+    }
 
     write_message(
-        &mut send,
-        &TransferResponse::accepted(destination.display().to_string()),
+        &mut control_send,
+        &TransferResponse::accepted(format!("receiving {} files", request.files.len())),
     )
     .await?;
-    let bar = progress.add(transfer_progress(
-        request.size,
-        format!("receiving {}", request.file_name),
-    )?);
+    control_send.finish()?;
 
-    let receive_result = receive_body(&mut receive, &mut file, request.size, &bar).await;
-    drop(file);
+    for (expected_index, entry) in request.files.iter().enumerate() {
+        let (mut send, mut receive) = timeout(CONTROL_TIMEOUT, connection.accept_bi())
+            .await
+            .context("sender did not open a file stream in time")??;
+        let file_request: FileRequest = timeout(CONTROL_TIMEOUT, read_message(&mut receive))
+            .await
+            .context("sender did not identify file stream in time")??;
+        if file_request.index != expected_index {
+            let error = anyhow!(
+                "received file stream {} but expected {}",
+                file_request.index,
+                expected_index
+            );
+            write_message(&mut send, &TransferResponse::rejected(error.to_string())).await?;
+            send.finish()?;
+            return Err(error);
+        }
 
-    if let Err(error) = receive_result {
-        bar.finish_and_clear();
-        let _ = fs::remove_file(&destination).await;
-        let _ = write_message(&mut send, &TransferResponse::rejected(error.to_string())).await;
-        let _ = send.finish();
-        return Err(error);
+        let (mut file, destination) = match create_destination_for_path(output, &entry.path).await {
+            Ok(destination) => destination,
+            Err(error) => {
+                write_message(
+                    &mut send,
+                    &TransferResponse::rejected(format!("cannot create destination: {error}")),
+                )
+                .await?;
+                send.finish()?;
+                return Err(error.into());
+            }
+        };
+        let bar = progress.add(transfer_progress(
+            entry.size,
+            format!("receiving {}", entry.path),
+        )?);
+        let receive_result = receive_body(&mut receive, &mut file, entry.size, &bar).await;
+        drop(file);
+
+        if let Err(error) = receive_result {
+            bar.finish_and_clear();
+            let _ = fs::remove_file(&destination).await;
+            let _ = write_message(&mut send, &TransferResponse::rejected(error.to_string())).await;
+            let _ = send.finish();
+            return Err(error);
+        }
+
+        write_message(&mut send, &TransferResponse::accepted("integrity verified")).await?;
+        send.finish()?;
+        bar.finish_with_message(format!("received {}", destination.display()));
+        println!("Saved: {}", destination.display());
     }
 
-    write_message(&mut send, &TransferResponse::accepted("integrity verified")).await?;
-    send.finish()?;
-    bar.finish_with_message(format!("received {}", destination.display()));
-    println!("Received {}", destination.display());
     connection.closed().await;
     Ok(())
 }
@@ -328,19 +500,44 @@ where
 
 async fn request_approval(
     remote: SocketAddr,
-    request: TransferRequest,
+    request: &TransferRequest,
     approval_lock: &Arc<Mutex<()>>,
 ) -> Result<bool> {
+    let file_count = request.files.len();
+    let total_size = request.files.iter().try_fold(0_u64, |total, file| {
+        total
+            .checked_add(file.size)
+            .ok_or_else(|| anyhow!("transfer size exceeds supported total"))
+    })?;
+    let preview: Vec<String> = request
+        .files
+        .iter()
+        .take(5)
+        .map(|file| format!("  • {} ({})", file.path, format_bytes(file.size)))
+        .collect();
+    let remaining = file_count.saturating_sub(preview.len());
     let _guard = approval_lock.lock().await;
     tokio::task::spawn_blocking(move || -> io::Result<bool> {
         if !io::stdin().is_terminal() {
             return Ok(false);
         }
 
-        print!(
-            "Accept {} bytes as `{}` from {}? [y/N] ",
-            request.size, request.file_name, remote
+        println!("\nIncoming transfer request");
+        println!("  From:  {remote}");
+        println!(
+            "  Total: {} file{} ({})",
+            file_count,
+            plural_suffix(file_count),
+            format_bytes(total_size)
         );
+        println!("  Files:");
+        for file in preview {
+            println!("{file}");
+        }
+        if remaining > 0 {
+            println!("  • and {remaining} more");
+        }
+        print!("\nAccept this transfer? [y/N] ");
         io::stdout().flush()?;
         let mut answer = String::new();
         io::stdin().read_line(&mut answer)?;
@@ -362,9 +559,35 @@ fn validate_request(request: &TransferRequest, max_size: u64) -> Result<()> {
             VERSION
         );
     }
-    validate_file_name(&request.file_name)?;
-    if request.size > max_size {
-        bail!("file exceeds receiver size limit");
+    if request.files.is_empty() {
+        bail!("transfer manifest contains no files");
+    }
+
+    let mut paths = std::collections::HashSet::new();
+    for file in &request.files {
+        validate_manifest_path(&file.path)?;
+        if file.size > max_size {
+            bail!("file `{}` exceeds receiver size limit", file.path);
+        }
+        if !paths.insert(&file.path) {
+            bail!("transfer manifest contains duplicate path `{}`", file.path);
+        }
+    }
+    Ok(())
+}
+
+fn validate_manifest_path(path: &str) -> Result<()> {
+    if path.is_empty() || path.len() > 4_096 {
+        bail!("transfer path must contain 1 to 4096 UTF-8 bytes");
+    }
+    if path.contains('\\') {
+        bail!("transfer path must use forward-slash separators");
+    }
+    if path.split('/').any(|component| component.is_empty()) {
+        bail!("transfer path contains an empty component");
+    }
+    for component in path.split('/') {
+        validate_file_name(component)?;
     }
     Ok(())
 }
@@ -410,6 +633,21 @@ fn is_reserved_windows_name(file_name: &str) -> bool {
             .is_some_and(|number| {
                 matches!(number, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
             })
+}
+
+async fn create_destination_for_path(
+    output: &Path,
+    relative_path: &str,
+) -> io::Result<(File, PathBuf)> {
+    let relative_path = Path::new(relative_path);
+    let parent = relative_path.parent().unwrap_or_else(|| Path::new(""));
+    let file_name = relative_path
+        .file_name()
+        .and_then(|file_name| file_name.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid destination name"))?;
+    let directory = output.join(parent);
+    fs::create_dir_all(&directory).await?;
+    create_destination(&directory, file_name).await
 }
 
 async fn create_destination(output: &Path, file_name: &str) -> io::Result<(File, PathBuf)> {
@@ -475,8 +713,9 @@ mod tests {
     use crate::{discovery::Peer, security::Identity};
 
     use super::{
-        collision_name, create_destination, handle_connection, receive_body, send_file,
-        stream_file, validate_file_name, validate_request, CHUNK_SIZE,
+        collect_files, collision_name, create_destination, handle_connection, receive_body,
+        send_files, stream_file, validate_file_name, validate_manifest_path, validate_request,
+        CHUNK_SIZE,
     };
 
     async fn receive_payload(payload: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
@@ -512,6 +751,30 @@ mod tests {
     }
 
     #[test]
+    fn manifest_path_should_accept_nested_file() {
+        assert!(validate_manifest_path("photos/2026/image.png").is_ok());
+    }
+
+    #[test]
+    fn manifest_path_should_reject_backslash_separator() {
+        assert!(validate_manifest_path("photos\\image.png").is_err());
+    }
+
+    #[tokio::test]
+    async fn collect_files_should_include_directory_hierarchy(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let source = directory.path().join("photos");
+        tokio::fs::create_dir_all(source.join("2026")).await?;
+        tokio::fs::write(source.join("2026").join("image.png"), b"image").await?;
+
+        let files = collect_files(&[source]).await?;
+
+        assert_eq!(files[0].relative_path, "photos/2026/image.png");
+        Ok(())
+    }
+
+    #[test]
     fn file_name_should_reject_windows_alternate_stream() {
         assert!(validate_file_name("notes.txt:hidden").is_err());
     }
@@ -530,8 +793,10 @@ mod tests {
     fn validate_request_should_accept_size_at_limit() {
         let request = crate::protocol::TransferRequest {
             version: crate::protocol::VERSION,
-            file_name: "notes.txt".to_owned(),
-            size: 42,
+            files: vec![crate::protocol::ManifestEntry {
+                path: "notes.txt".to_owned(),
+                size: 42,
+            }],
         };
 
         assert!(validate_request(&request, 42).is_ok());
@@ -541,8 +806,10 @@ mod tests {
     fn validate_request_should_reject_size_over_limit() {
         let request = crate::protocol::TransferRequest {
             version: crate::protocol::VERSION,
-            file_name: "notes.txt".to_owned(),
-            size: 43,
+            files: vec![crate::protocol::ManifestEntry {
+                path: "notes.txt".to_owned(),
+                size: 43,
+            }],
         };
 
         assert!(validate_request(&request, 42).is_err());
@@ -699,7 +966,7 @@ mod tests {
             .await
         });
 
-        timeout(Duration::from_secs(10), send_file(&source, &peer)).await??;
+        timeout(Duration::from_secs(10), send_files(&[source], &peer)).await??;
         timeout(Duration::from_secs(10), server).await???;
 
         assert_eq!(
