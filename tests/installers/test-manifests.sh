@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
 validator=$repo_root/scripts/release/verify-assets.sh
 version=0.1.0
 temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/gitler-manifest-test.XXXXXX")

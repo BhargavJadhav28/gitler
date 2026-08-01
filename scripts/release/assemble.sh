@@ -24,8 +24,8 @@ if [[ -e "$output_dir" || -L "$output_dir" ]]; then
     fail "output directory already exists: $output_dir"
 fi
 
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-repo_root=$(CDPATH= cd -- "$script_dir/../.." && pwd)
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+repo_root=$(CDPATH='' cd -- "$script_dir/../.." && pwd)
 mkdir -p "$output_dir"
 
 copy_builder_asset() {

@@ -299,7 +299,9 @@ validate_manifest() {
 }
 
 validate_state() {
-    [ -f "$STATE_PATH" ] && [ ! -L "$STATE_PATH" ] || fail 'installer state file is missing or is not a regular file'
+    if [ ! -f "$STATE_PATH" ] || [ -L "$STATE_PATH" ]; then
+        fail 'installer state file is missing or is not a regular file'
+    fi
     if ! awk -F= '
         BEGIN {
             required["format_version"] = 1
@@ -339,7 +341,9 @@ validate_state() {
     CURRENT_PATH_HASH=$(state_value path_block_sha256) || fail 'PATH block hash state is unreadable'
     case "$CURRENT_PATH_SHELL" in
         none)
-            [ -z "$CURRENT_PATH_FILE" ] && [ -z "$CURRENT_PATH_HASH" ] || fail 'empty PATH ownership has non-empty metadata'
+            if [ -n "$CURRENT_PATH_FILE" ] || [ -n "$CURRENT_PATH_HASH" ]; then
+                fail 'empty PATH ownership has non-empty metadata'
+            fi
             ;;
         bash|zsh|fish)
             [ -n "$CURRENT_PATH_FILE" ] || fail 'PATH ownership has no profile path'
@@ -389,9 +393,9 @@ write_path_block() {
         printf '%s\n' '# >>> gitler installer PATH (do not edit) >>>'
         case "$shell" in
             bash|zsh)
-                printf '%s\n' 'case ":$PATH:" in'
+                printf '%s\n' "case \":\$PATH:\" in"
                 printf '  *:%s:*) ;;\n' "$quoted"
-                printf '  *) PATH=%s:"$PATH"; export PATH ;;\n' "$quoted"
+                printf "  *) PATH=%s:\"\$PATH\"; export PATH ;;\n" "$quoted"
                 printf '%s\n' 'esac'
                 ;;
             fish)
@@ -442,7 +446,9 @@ remove_path_block() {
     profile=$CURRENT_PATH_FILE
     expected_profile=$(path_profile_for_shell "$CURRENT_PATH_SHELL") || fail 'PATH ownership shell is unsupported'
     [ "$profile" = "$expected_profile" ] || fail 'PATH ownership points outside the supported user profile location'
-    [ -f "$profile" ] && [ ! -L "$profile" ] || fail "owned PATH profile '$profile' is missing or is not a regular file"
+    if [ ! -f "$profile" ] || [ -L "$profile" ]; then
+        fail "owned PATH profile '$profile' is missing or is not a regular file"
+    fi
 
     block=$TMP_DIR/path-block
     write_path_block "$CURRENT_PATH_SHELL" "$INSTALL_DIR" "$block"
@@ -505,7 +511,9 @@ write_state_contents() {
 
 write_state() {
     STATE_TMP_FILE="$INSTALL_DIR/.gitler-state.tmp.$$"
-    [ ! -e "$STATE_TMP_FILE" ] && [ ! -L "$STATE_TMP_FILE" ] || fail 'another installation appears to be updating state'
+    if [ -e "$STATE_TMP_FILE" ] || [ -L "$STATE_TMP_FILE" ]; then
+        fail 'another installation appears to be updating state'
+    fi
     write_state_contents "$STATE_TMP_FILE" "$@"
     if ! mv -f "$STATE_TMP_FILE" "$STATE_PATH"; then
         rm -f "$STATE_TMP_FILE"
@@ -517,7 +525,9 @@ write_state() {
 
 prepare_state() {
     STATE_TMP_FILE="$INSTALL_DIR/.gitler-state.tmp.$$"
-    [ ! -e "$STATE_TMP_FILE" ] && [ ! -L "$STATE_TMP_FILE" ] || fail 'another installation appears to be updating state'
+    if [ -e "$STATE_TMP_FILE" ] || [ -L "$STATE_TMP_FILE" ]; then
+        fail 'another installation appears to be updating state'
+    fi
     write_state_contents "$STATE_TMP_FILE" "$@"
 }
 
@@ -536,7 +546,7 @@ print_path_instructions() {
         printf 'PATH block added to %s. Open a new terminal or source that profile.\n' "$CURRENT_PATH_FILE"
         return
     fi
-    printf 'Current terminal: export PATH=%s:"$PATH"\n' "$quoted"
+    printf "Current terminal: export PATH=%s:\"\$PATH\"\n" "$quoted"
     case "${SHELL:-}" in
         */bash) shell_name=bash ;;
         */zsh) shell_name=zsh ;;
@@ -544,8 +554,8 @@ print_path_instructions() {
         *) shell_name=unknown ;;
     esac
     case "$shell_name" in
-        bash) printf 'Persistent Bash command: export PATH=%s:"$PATH"  # add to ~/.bashrc\n' "$quoted" ;;
-        zsh) printf 'Persistent Zsh command: export PATH=%s:"$PATH"  # add to ~/.zshrc\n' "$quoted" ;;
+        bash) printf "Persistent Bash command: export PATH=%s:\"\$PATH\"  # add to ~/.bashrc\n" "$quoted" ;;
+        zsh) printf "Persistent Zsh command: export PATH=%s:\"\$PATH\"  # add to ~/.zshrc\n" "$quoted" ;;
         fish) printf 'Persistent Fish command: fish_add_path --path --move %s\n' "$quoted" ;;
         *) printf 'Persistent PATH: add %s to your shell profile manually; unknown shell is not edited.\n' "$quoted" ;;
     esac
@@ -709,7 +719,9 @@ fi
 
 STAGE_FILE=$INSTALL_DIR/.gitler-stage.$$
 ROLLBACK_FILE=$INSTALL_DIR/.gitler-rollback.$$
-[ ! -e "$STAGE_FILE" ] && [ ! -e "$ROLLBACK_FILE" ] || fail 'another installation appears to be in progress'
+if [ -e "$STAGE_FILE" ] || [ -e "$ROLLBACK_FILE" ]; then
+    fail 'another installation appears to be in progress'
+fi
 cp "$binary_file" "$STAGE_FILE"
 chmod 755 "$STAGE_FILE"
 stage_version=$("$STAGE_FILE" --version 2>&1) || fail 'staged executable failed --version'
@@ -727,7 +739,9 @@ old_path_file=$CURRENT_PATH_FILE
 old_path_hash=$CURRENT_PATH_HASH
 prepare_state "$RESOLVED_VERSION" "$ASSET_NAME" "$actual_hash" "$old_path_shell" "$old_path_file" "$old_path_hash"
 if ! mv -f "$STAGE_FILE" "$BINARY_PATH"; then
-    [ "$had_old" -eq 1 ] && mv -f "$ROLLBACK_FILE" "$BINARY_PATH" || true
+    if [ "$had_old" -eq 1 ]; then
+        mv -f "$ROLLBACK_FILE" "$BINARY_PATH" || true
+    fi
     fail 'atomic executable replacement failed; existing executable was preserved'
 fi
 if ! commit_prepared_state; then
