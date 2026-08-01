@@ -5,6 +5,9 @@ edition = "2021"
 rust-version = "1.88"
 description = "Zero-configuration local mesh file transfer over mDNS and QUIC"
 license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/BhargavJadhav28/gitler"
+homepage = "https://github.com/BhargavJadhav28/gitler"
 
 keywords = ["filesharing", "mdns", "p2p", "quic"]
 categories = ["command-line-utilities", "network-programming"]

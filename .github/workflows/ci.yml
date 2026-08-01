@@ -9,17 +9,114 @@ permissions:
 
 jobs:
   check:
+    name: Check (${{ matrix.os }})
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-24.04, windows-2025]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+
+      - name: Install pinned release toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.97.1
           components: clippy,rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo generate-lockfile
-      - run: cargo fmt --check
-      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
-      - run: cargo test --all-features --locked
+
+      - name: Verify committed release toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Fqx 'channel = "1.97.1"' rust-toolchain.toml
+          rustc --version
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Run tests
+        run: cargo test --all-features --locked
+
+      - name: Build debug profile
+        run: cargo build --all-features --locked
+
+      - name: Build release profile
+        run: cargo build --release --all-features --locked
+
+      - name: Smoke-test help
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = Windows ]; then
+            ./target/debug/gitler.exe --help
+            ./target/release/gitler.exe --help
+          else
+            ./target/debug/gitler --help
+            ./target/release/gitler --help
+          fi
+
+      - name: Parse PowerShell installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $PWD 'install.ps1'),
+            [ref]$tokens,
+            [ref]$errors
+          ) | Out-Null
+          if ($errors.Count -ne 0) {
+            $errors | ForEach-Object { $_.ToString() }
+            exit 1
+          }
+
+  msrv:
+    name: MSRV (Rust 1.88)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install MSRV toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.88.0
+          components: clippy,rustfmt
+
+      - name: Check MSRV formatting
+        run: cargo +1.88.0 fmt --check
+
+      - name: Check MSRV Clippy
+        run: cargo +1.88.0 clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Run MSRV tests
+        run: cargo +1.88.0 test --all-features --locked
+
+  release-surface:
+    name: Validate release scripts
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run shell syntax and manifest fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          shellcheck install.sh scripts/release/*.sh tests/installers/*.sh
+          bash tests/installers/test-manifests.sh
+          bash tests/installers/test-install-sh.sh
+
+      - name: Parse workflow YAML
+        run: ruby -e "require 'yaml'; YAML.load_file('.github/workflows/ci.yml'); YAML.load_file('.github/workflows/release.yml')"

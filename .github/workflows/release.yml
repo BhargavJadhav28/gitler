@@ -1,0 +1,526 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Annotated stable tag to release, for example v0.1.0'
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: Validate release request
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      WORKFLOW_REF: ${{ github.ref }}
+      GH_TOKEN: ${{ github.token }}
+    outputs:
+      tag: ${{ steps.validate.outputs.tag }}
+      version: ${{ steps.validate.outputs.version }}
+      toolchain: ${{ steps.validate.outputs.toolchain }}
+      commit: ${{ steps.validate.outputs.commit }}
+    steps:
+      - name: Check out protected default-branch workflow
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate tag, ancestry, version, and release state
+        id: validate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          [[ "$WORKFLOW_REF" == "refs/heads/$DEFAULT_BRANCH" ]] || {
+            echo 'release workflow must be dispatched from the protected default branch' >&2
+            exit 1
+          }
+
+          if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo 'tag must exactly match vMAJOR.MINOR.PATCH without leading zeroes' >&2
+            exit 1
+          fi
+
+          if ! git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            git fetch --force origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          fi
+          tag_object=$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{tag}")
+          [[ "$(git cat-file -t "$tag_object")" == tag ]] || {
+            echo 'release tag must be annotated' >&2
+            exit 1
+          }
+          commit=$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")
+          [[ "$(git cat-file -t "$commit")" == commit ]] || {
+            echo 'release tag must resolve to exactly one commit' >&2
+            exit 1
+          }
+
+          git fetch --force origin "refs/heads/$DEFAULT_BRANCH:refs/remotes/origin/$DEFAULT_BRANCH"
+          git merge-base --is-ancestor "$commit" "refs/remotes/origin/$DEFAULT_BRANCH" || {
+            echo 'release tag commit is not an ancestor of the protected default branch' >&2
+            exit 1
+          }
+          [[ -z "$(git status --porcelain)" ]] || {
+            echo 'checked-out release source is not clean' >&2
+            exit 1
+          }
+
+          cargo_version=$(git show "$commit:Cargo.toml" | \
+            python3 -c 'import sys, tomllib; print(tomllib.load(sys.stdin.buffer)["package"]["version"])')
+          version=${RELEASE_TAG#v}
+          [[ "$cargo_version" == "$version" ]] || {
+            echo "Cargo version $cargo_version does not match tag version $version" >&2
+            exit 1
+          }
+
+          release_toolchain=$(git show "$commit:rust-toolchain.toml" | \
+            python3 -c 'import sys, tomllib; print(tomllib.load(sys.stdin.buffer)["toolchain"]["channel"])')
+          [[ "$release_toolchain" == '1.97.1' ]] || {
+            echo "tag release toolchain $release_toolchain does not match workflow policy 1.97.1" >&2
+            exit 1
+          }
+
+          set +e
+          release_response=$(gh api --include "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" 2>&1)
+          release_status=$?
+          set -e
+          if [[ "$release_status" -eq 0 ]]; then
+            echo "a GitHub Release already exists for $RELEASE_TAG" >&2
+            exit 1
+          fi
+          if ! grep -Eq 'HTTP/[0-9.]+[[:space:]]+404[[:space:]]' <<< "$release_response"; then
+            echo 'could not prove that no GitHub Release exists' >&2
+            printf '%s\n' "$release_response" | tail -n 5 >&2
+            exit 1
+          fi
+
+          {
+            printf 'tag=%s\n' "$RELEASE_TAG"
+            printf 'version=%s\n' "$version"
+            printf 'toolchain=%s\n' "$release_toolchain"
+            printf 'commit=%s\n' "$commit"
+          } >> "$GITHUB_OUTPUT"
+
+  build-windows:
+    name: Build Windows x86_64
+    needs: preflight
+    runs-on: windows-2025
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.preflight.outputs.version }}
+      COMMIT_SHA: ${{ needs.preflight.outputs.commit }}
+      TARGET: x86_64-pc-windows-msvc
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install committed release toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: ${{ needs.preflight.outputs.toolchain }}
+          targets: x86_64-pc-windows-msvc
+          components: clippy,rustfmt
+
+      - name: Assert runner and Rust target
+        shell: pwsh
+        run: |
+          $actualArchitecture = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+          if ($actualArchitecture -ne 'AMD64') { throw "Expected Windows x86_64 runner, got $actualArchitecture" }
+          $rustTarget = (rustc -vV | Select-String '^host:').ToString().Split(':', 2)[1].Trim()
+          if ($rustTarget -ne $env:TARGET) { throw "Expected Rust target $env:TARGET, got $rustTarget" }
+
+      - name: Run locked validation
+        shell: pwsh
+        run: |
+          cargo fmt --check
+          cargo clippy --target $env:TARGET --all-targets --all-features --locked -- -D warnings
+          cargo test --target $env:TARGET --all-features --locked
+          cargo build --release --target $env:TARGET --locked
+
+      - name: Inspect and smoke-test Windows binary
+        shell: pwsh
+        run: |
+          $binary = Join-Path $PWD "target\$env:TARGET\release\gitler.exe"
+          if (!(Test-Path -LiteralPath $binary -PathType Leaf)) { throw "Missing release binary $binary" }
+          $versionOutput = (& $binary --version 2>&1 | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $versionOutput -ne "gitler $env:VERSION") { throw "Unexpected --version output: $versionOutput" }
+          & $binary --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw '--help failed' }
+
+          $bytes = [IO.File]::ReadAllBytes($binary)
+          if ($bytes.Length -lt 64 -or $bytes[0] -ne 0x4d -or $bytes[1] -ne 0x5a) { throw 'Binary is not a PE executable' }
+          $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
+          $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+          if ($machine -ne 0x8664) { throw "Unexpected PE machine value: $machine" }
+
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (!(Test-Path -LiteralPath $vswhere)) { throw 'vswhere.exe is required for Windows dependency inspection' }
+          $installPath = (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath).Trim()
+          if (!$installPath) { throw 'Visual C++ tools installation was not found' }
+          $dumpbin = Get-ChildItem -LiteralPath (Join-Path $installPath 'VC\Tools\MSVC') -Filter dumpbin.exe -Recurse | Select-Object -First 1
+          if (!$dumpbin) { throw 'dumpbin.exe was not found' }
+          $dependencies = & $dumpbin.FullName /DEPENDENTS $binary 2>&1 | Out-String
+          if ($dependencies -match '(?i)(VCRUNTIME|MSVCP|ucrtbase)') {
+            throw 'Windows binary has a dynamic Visual C++ runtime dependency'
+          }
+
+          $staging = Join-Path $env:RUNNER_TEMP "gitler-v$env:VERSION-windows-x86_64.exe"
+          Copy-Item -LiteralPath $binary -Destination $staging
+
+      - name: Upload temporary builder artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: builder-windows-x86_64
+          path: ${{ runner.temp }}/gitler-v${{ needs.preflight.outputs.version }}-windows-x86_64.exe
+          if-no-files-found: error
+          retention-days: 2
+
+  build-macos:
+    name: Build macOS ${{ matrix.name }}
+    needs: preflight
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Intel
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            uname: x86_64
+            asset: macos-x86_64
+          - name: Apple Silicon
+            runner: macos-15
+            target: aarch64-apple-darwin
+            uname: arm64
+            asset: macos-aarch64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.preflight.outputs.version }}
+      TARGET: ${{ matrix.target }}
+      EXPECTED_UNAME: ${{ matrix.uname }}
+      ASSET_SUFFIX: ${{ matrix.asset }}
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install committed release toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: ${{ needs.preflight.outputs.toolchain }}
+          targets: ${{ matrix.target }}
+          components: clippy,rustfmt
+
+      - name: Run locked validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "$EXPECTED_UNAME"
+          rustc -vV | grep -Fqx "host: $TARGET"
+          cargo fmt --check
+          cargo clippy --target "$TARGET" --all-targets --all-features --locked -- -D warnings
+          cargo test --target "$TARGET" --all-features --locked
+          cargo build --release --target "$TARGET" --locked
+
+      - name: Inspect and smoke-test macOS binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/$TARGET/release/gitler"
+          test -f "$binary" && test ! -L "$binary"
+          version_output=$("$PWD/$binary" --version)
+          test "$version_output" = "gitler $VERSION"
+          "$PWD/$binary" --help >/dev/null
+          file_output=$(file "$binary")
+          printf '%s\n' "$file_output" | grep -Fq "$EXPECTED_UNAME"
+          deployment_target=$(otool -l "$binary" | awk '
+            /cmd LC_BUILD_VERSION/ { build = 1; macos = 0; next }
+            build && /^Load command/ { build = 0; macos = 0 }
+            build && /platform MACOS/ { macos = 1; next }
+            build && macos && /minos/ { print $2; exit }
+            /cmd LC_VERSION_MIN_MACOSX/ { legacy = 1; next }
+            legacy && /^Load command/ { legacy = 0 }
+            legacy && /version/ { print $2; exit }
+          ')
+          test "$deployment_target" = '11.0' || {
+            echo "unexpected macOS deployment target: $deployment_target" >&2
+            exit 1
+          }
+          otool -L "$binary" > "$RUNNER_TEMP/otool.txt"
+          if ! awk 'NR > 1 { sub(/^[[:space:]]*/, "", $0); sub(/[[:space:]].*$/, "", $0); if ($0 !~ /^\/usr\/lib\// && $0 !~ /^\/System\/Library\//) { print; bad = 1 } } END { exit bad }' "$RUNNER_TEMP/otool.txt"; then
+            echo 'macOS binary has a non-system runtime dependency' >&2
+            exit 1
+          fi
+          cp "$binary" "$RUNNER_TEMP/gitler-v$VERSION-$ASSET_SUFFIX"
+
+      - name: Upload temporary builder artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: builder-${{ matrix.asset }}
+          path: ${{ runner.temp }}/gitler-v${{ needs.preflight.outputs.version }}-${{ matrix.asset }}
+          if-no-files-found: error
+          retention-days: 2
+
+  build-linux:
+    name: Build Linux x86_64 glibc 2.35 baseline
+    needs: preflight
+    runs-on: ubuntu-24.04
+    container: ubuntu:22.04@sha256:0e0a0fc6d18feda9db1590da249ac93e8d5abfea8f4c3c0c849ce512b5ef8982
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.preflight.outputs.version }}
+      TARGET: x86_64-unknown-linux-gnu
+    steps:
+      - name: Install container build prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl git build-essential pkg-config file binutils
+          rm -rf /var/lib/apt/lists/*
+
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install committed release toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: ${{ needs.preflight.outputs.toolchain }}
+          targets: x86_64-unknown-linux-gnu
+          components: clippy,rustfmt
+
+      - name: Run locked validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          rustc -vV | grep -Fqx "host: $TARGET"
+          cargo fmt --check
+          cargo clippy --target "$TARGET" --all-targets --all-features --locked -- -D warnings
+          cargo test --target "$TARGET" --all-features --locked
+          cargo build --release --target "$TARGET" --locked
+
+      - name: Inspect and smoke-test Linux binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/$TARGET/release/gitler"
+          test -f "$binary" && test ! -L "$binary"
+          version_output=$("$PWD/$binary" --version)
+          test "$version_output" = "gitler $VERSION"
+          "$PWD/$binary" --help >/dev/null
+          file_output=$(file "$binary")
+          printf '%s\n' "$file_output" | grep -Eq 'ELF 64-bit.*x86-64'
+          readelf -h "$binary" | grep -Fq 'Class:                             ELF64'
+          readelf -h "$binary" | grep -Fq 'Machine:                           Advanced Micro Devices X86-64'
+          interpreter=$(readelf -l "$binary" | awk '/Requesting program interpreter/ { gsub(/\]/, ""); print $NF }')
+          case "$interpreter" in
+            /lib64/ld-linux-x86-64.so.2|/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2) ;;
+            *) echo "unexpected dynamic loader: $interpreter" >&2; exit 1 ;;
+          esac
+          max_glibc=$(readelf --version-info "$binary" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -Vu | tail -n 1 || true)
+          if [ -n "$max_glibc" ] && [ "$(printf '%s\n' "$max_glibc" GLIBC_2.35 | sort -V | tail -n 1)" != GLIBC_2.35 ]; then
+            echo "binary requires newer than glibc 2.35: $max_glibc" >&2
+            exit 1
+          fi
+          cp "$binary" "$RUNNER_TEMP/gitler-v$VERSION-linux-x86_64-gnu"
+
+      - name: Upload temporary builder artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: builder-linux-x86_64-gnu
+          path: ${{ runner.temp }}/gitler-v${{ needs.preflight.outputs.version }}-linux-x86_64-gnu
+          if-no-files-found: error
+          retention-days: 2
+
+  assemble:
+    name: Assemble and verify release assets
+    needs: [preflight, build-windows, build-macos, build-linux]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.preflight.outputs.version }}
+    steps:
+      - name: Check out tagged release scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Collect builder artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: builder-*
+          path: builder-assets
+          merge-multiple: true
+
+      - name: Assemble exact seven-file contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/release/assemble.sh "$VERSION" "$PWD/builder-assets" "$PWD/release-assets"
+
+      - name: Upload assembled release artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-assets
+          path: release-assets
+          if-no-files-found: error
+          retention-days: 7
+
+  draft:
+    name: Attest and create draft release
+    needs: [preflight, assemble]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    env:
+      RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+      VERSION: ${{ needs.preflight.outputs.version }}
+      COMMIT_SHA: ${{ needs.preflight.outputs.commit }}
+      GH_TOKEN: ${{ github.token }}
+    outputs:
+      release_id: ${{ steps.create-release.outputs.release_id }}
+    steps:
+      - name: Download assembled release artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-assets
+          path: release-assets
+
+      - name: Generate provenance attestations for every final asset
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: release-assets/*
+
+      - name: Verify every asset attestation against exact repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          for asset in release-assets/*; do
+            gh attestation verify "$asset" -R "$GITHUB_REPOSITORY"
+          done
+
+      - name: Create draft release
+        id: create-release
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_json="$RUNNER_TEMP/release.json"
+          gh api --method POST "repos/$GITHUB_REPOSITORY/releases" \
+            -f tag_name="$RELEASE_TAG" \
+            -f target_commitish="$COMMIT_SHA" \
+            -f name="gitler $RELEASE_TAG" \
+            -f body="Native binaries for $RELEASE_TAG. Verify SHA256SUMS and artifact attestations before installation." \
+            -F draft=true \
+            -F prerelease=false \
+            -F generate_release_notes=false > "$release_json"
+          release_id=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["id"])' "$release_json")
+          printf 'release_id=%s\n' "$release_id" >> "$GITHUB_OUTPUT"
+
+      - name: Upload complete asset set once
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release upload "$RELEASE_TAG" release-assets/* --repo "$GITHUB_REPOSITORY"
+
+      - name: Re-download draft assets through GitHub API and verify
+        shell: bash
+        env:
+          RELEASE_ID: ${{ steps.create-release.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          release_id="$RELEASE_ID"
+          verify_dir="$RUNNER_TEMP/draft-assets"
+          mkdir -p "$verify_dir"
+          mapfile -t expected_names < <(printf '%s\n' \
+            "gitler-v$VERSION-windows-x86_64.exe" \
+            "gitler-v$VERSION-macos-x86_64" \
+            "gitler-v$VERSION-macos-aarch64" \
+            "gitler-v$VERSION-linux-x86_64-gnu" \
+            install.sh install.ps1 SHA256SUMS)
+          mapfile -t asset_rows < <(gh api --paginate "repos/$GITHUB_REPOSITORY/releases/$release_id/assets?per_page=100" --jq '.[] | [.id, .name] | @tsv')
+          [[ "${#asset_rows[@]}" -eq 7 ]] || { echo 'draft release does not contain exactly seven assets' >&2; exit 1; }
+          for row in "${asset_rows[@]}"; do
+            IFS=$'\t' read -r asset_id asset_name <<< "$row"
+            allowed=0
+            for expected_name in "${expected_names[@]}"; do
+              [[ "$asset_name" == "$expected_name" ]] && allowed=1
+            done
+            (( allowed == 1 )) || { echo "unexpected draft asset: $asset_name" >&2; exit 1; }
+            gh api -H 'Accept: application/octet-stream' "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" > "$verify_dir/$asset_name"
+          done
+          mapfile -t downloaded_paths < <(find "$verify_dir" -mindepth 1 -maxdepth 1 -type f -print | sort)
+          [[ "${#downloaded_paths[@]}" -eq 7 ]] || { echo 'draft download count mismatch' >&2; exit 1; }
+          for expected_name in "${expected_names[@]}"; do
+            test -f "$verify_dir/$expected_name"
+          done
+          cmp -s release-assets/SHA256SUMS "$verify_dir/SHA256SUMS"
+          while IFS='  ' read -r expected_hash asset_name; do
+            case "$asset_name" in
+              SHA256SUMS) continue ;;
+            esac
+            actual_hash=$(sha256sum "$verify_dir/$asset_name" | awk '{ print $1 }')
+            [[ "$actual_hash" == "$expected_hash" ]] || { echo "draft checksum mismatch: $asset_name" >&2; exit 1; }
+          done < "$verify_dir/SHA256SUMS"
+          chmod 755 "$verify_dir/gitler-v$VERSION-linux-x86_64-gnu"
+          "$verify_dir/gitler-v$VERSION-linux-x86_64-gnu" --version | grep -Fqx "gitler $VERSION"
+          "$verify_dir/gitler-v$VERSION-linux-x86_64-gnu" --help >/dev/null
+
+  publish:
+    name: Publish approved draft release
+    needs: [preflight, draft]
+    runs-on: ubuntu-24.04
+    environment:
+      name: production
+      url: https://github.com/${{ github.repository }}/releases/tag/${{ needs.preflight.outputs.tag }}
+    permissions:
+      contents: write
+    env:
+      RELEASE_ID: ${{ needs.draft.outputs.release_id }}
+      RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Publish draft as latest stable release
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            -F draft=false \
+            -F prerelease=false \
+            -F make_latest=true >/dev/null
+          printf 'Published %s as the latest stable release.\n' "$RELEASE_TAG"
