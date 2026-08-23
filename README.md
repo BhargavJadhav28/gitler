@@ -71,10 +71,12 @@ Get-Content -LiteralPath $installer
 & $installer -Version $version
 ```
 
-The installers resolve `latest` once, validate the expected release assets, and
-then download the checksum and selected binary from that release tag. If the
-latest lookup fails or is rate-limited, use an explicit `--version vX.Y.Z` or
-`-Version vX.Y.Z`.
+Default installs resolve `latest` once, validate the expected stable Release
+assets, then download the checksum and selected binary from that exact tag.
+Exact-version installs query only the requested tagged Release and reject a
+missing, draft, prerelease, malformed, or incomplete Release before downloading
+the binary. If latest lookup fails or is rate-limited, use explicit
+`--version vX.Y.Z` or `-Version vX.Y.Z`.
 
 These convenience forms execute code received directly from the network. Use
 the download-first form above when you want to inspect the script first:

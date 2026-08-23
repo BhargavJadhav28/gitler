@@ -2,7 +2,8 @@
 set -eu
 
 REPOSITORY='BhargavJadhav28/gitler'
-LATEST_API="https://api.github.com/repos/$REPOSITORY/releases/latest"
+RELEASES_API="https://api.github.com/repos/$REPOSITORY/releases"
+LATEST_API="$RELEASES_API/latest"
 INSTALL_STATE='.gitler-install-state'
 PROGRAM='gitler'
 FORMAT_VERSION='1'
@@ -219,6 +220,32 @@ contains_asset_name() {
     grep -Fq "\"name\": \"$name\"" "$file" || grep -Fq "\"name\":\"$name\"" "$file"
 }
 
+validate_release_metadata() {
+    release_file=$1
+    release_description=$2
+    expected_tag=${3:-}
+
+    RESOLVED_TAG=$(json_string_value tag_name "$release_file")
+    [ -n "$RESOLVED_TAG" ] || fail "$release_description has no tag_name"
+    [ -z "$expected_tag" ] || [ "$RESOLVED_TAG" = "$expected_tag" ] ||
+        fail "$release_description resolved tag '$RESOLVED_TAG', not requested tag '$expected_tag'"
+    case "$RESOLVED_TAG" in
+        v*) RESOLVED_VERSION=${RESOLVED_TAG#v} ;;
+        *) fail "$release_description tag '$RESOLVED_TAG' is not a stable vMAJOR.MINOR.PATCH tag" ;;
+    esac
+    validate_version "$RESOLVED_VERSION"
+    [ "$(json_boolean_value draft "$release_file")" = 'false' ] ||
+        fail "$release_description is draft or has malformed draft metadata"
+    [ "$(json_boolean_value prerelease "$release_file")" = 'false' ] ||
+        fail "$release_description is prerelease or has malformed prerelease metadata"
+
+    ASSET_NAME="gitler-v${RESOLVED_VERSION}-${ASSET_SUFFIX}"
+    for name in "$ASSET_NAME" install.sh install.ps1 SHA256SUMS; do
+        contains_asset_name "$name" "$release_file" ||
+            fail "$release_description is missing expected asset '$name'"
+    done
+}
+
 resolve_latest_release() {
     latest_file=$TMP_DIR/latest.json
     status_file=$TMP_DIR/latest.status
@@ -234,20 +261,28 @@ resolve_latest_release() {
         *) fail "GitHub latest release API returned HTTP $status; rerun with an explicit version after fixing access" ;;
     esac
 
-    RESOLVED_TAG=$(json_string_value tag_name "$latest_file")
-    [ -n "$RESOLVED_TAG" ] || fail 'latest release response has no tag_name'
-    case "$RESOLVED_TAG" in
-        v*) RESOLVED_VERSION=${RESOLVED_TAG#v} ;;
-        *) fail "latest release tag '$RESOLVED_TAG' is not a stable vMAJOR.MINOR.PATCH tag" ;;
-    esac
-    validate_version "$RESOLVED_VERSION"
-    [ "$(json_boolean_value draft "$latest_file")" = 'false' ] || fail 'latest release is draft or has malformed draft metadata'
-    [ "$(json_boolean_value prerelease "$latest_file")" = 'false' ] || fail 'latest release is prerelease or has malformed prerelease metadata'
+    validate_release_metadata "$latest_file" 'latest release'
+}
 
-    ASSET_NAME="gitler-v${RESOLVED_VERSION}-${ASSET_SUFFIX}"
-    for name in "$ASSET_NAME" install.sh install.ps1 SHA256SUMS; do
-        contains_asset_name "$name" "$latest_file" || fail "latest release is missing expected asset '$name'"
-    done
+resolve_exact_release() {
+    requested_tag=$1
+    release_file=$TMP_DIR/release.json
+    status_file=$TMP_DIR/release.status
+    release_api="$RELEASES_API/tags/$requested_tag"
+    if ! curl -qfsSL --proto '=https' --proto-redir '=https' \
+        --connect-timeout 20 --max-time 60 \
+        -o "$release_file" -w '%{http_code}' "$release_api" > "$status_file"; then
+        fail "release lookup for '$requested_tag' failed; check GitHub access and retry"
+    fi
+    status=$(cat "$status_file")
+    case "$status" in
+        200) ;;
+        403|429) fail "GitHub API rate limit reached while resolving '$requested_tag'; retry later" ;;
+        404) fail "GitHub Release '$requested_tag' does not exist or is not publicly available" ;;
+        *) fail "GitHub Release API for '$requested_tag' returned HTTP $status" ;;
+    esac
+
+    validate_release_metadata "$release_file" "release '$requested_tag'" "$requested_tag"
 }
 
 download_https() {
@@ -654,11 +689,11 @@ fi
 
 if [ -n "$REQUESTED_VERSION" ]; then
     case "$REQUESTED_VERSION" in
-        v*) RESOLVED_VERSION=${REQUESTED_VERSION#v}; RESOLVED_TAG=$REQUESTED_VERSION ;;
+        v*) RESOLVED_VERSION=${REQUESTED_VERSION#v} ;;
         *) fail "version '$REQUESTED_VERSION' must start with v" ;;
     esac
     validate_version "$RESOLVED_VERSION"
-    ASSET_NAME="gitler-v${RESOLVED_VERSION}-${ASSET_SUFFIX}"
+    resolve_exact_release "$REQUESTED_VERSION"
 else
     resolve_latest_release
 fi

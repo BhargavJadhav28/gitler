@@ -24,11 +24,17 @@ cat > "$mock_bin/curl" <<'EOF'
 set -eu
 output=''
 url=''
+write_status=0
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        -o|-w|--connect-timeout|--max-time|--retry|--retry-delay)
+        -o|--connect-timeout|--max-time|--retry|--retry-delay)
             if [ "$#" -lt 2 ]; then exit 2; fi
             if [ "$1" = '-o' ]; then output=$2; fi
+            shift 2
+            ;;
+        -w)
+            if [ "$#" -lt 2 ]; then exit 2; fi
+            write_status=1
             shift 2
             ;;
         --proto|--proto-redir)
@@ -40,10 +46,16 @@ while [ "$#" -gt 0 ]; do
 done
 [ -n "$output" ] || exit 2
 case "$url" in
+    *releases/tags/v0.1.0)
+        cp "$FIXTURE_DIR/${MOCK_RELEASE_FILE:-release.json}" "$output"
+        ;;
     *SHA256SUMS) cp "$FIXTURE_DIR/SHA256SUMS" "$output" ;;
     *gitler-v0.1.0-linux-x86_64-gnu) cp "$FIXTURE_DIR/gitler-v0.1.0-linux-x86_64-gnu" "$output" ;;
     *) exit 22 ;;
 esac
+if [ "$write_status" -eq 1 ]; then
+    printf '200'
+fi
 EOF
 
 cat > "$fixture_dir/gitler-v0.1.0-linux-x86_64-gnu" <<'EOF'
@@ -74,6 +86,11 @@ printf 'Write-Output install\n' > "$fixture_dir/install.ps1"
         printf '%s  %s\n' "$hash" "$name"
     done
 ) | LC_ALL=C sort -k2,2 > "$fixture_dir/SHA256SUMS"
+
+cat > "$fixture_dir/release.json" <<'EOF'
+{"tag_name":"v0.1.0","draft":false,"prerelease":false,"assets":[{"name":"gitler-v0.1.0-windows-x86_64.exe"},{"name":"gitler-v0.1.0-macos-x86_64"},{"name":"gitler-v0.1.0-macos-aarch64"},{"name":"gitler-v0.1.0-linux-x86_64-gnu"},{"name":"install.sh"},{"name":"install.ps1"},{"name":"SHA256SUMS"}]}
+EOF
+sed 's/"draft":false/"draft":true/' "$fixture_dir/release.json" > "$fixture_dir/release-draft.json"
 
 PATH="$mock_bin:$PATH" HOME="$home_dir" SHELL=/bin/bash FIXTURE_DIR="$fixture_dir" \
     "$repo_root/install.sh" --version v0.1.0 --modify-path --install-dir "$install_dir" >/dev/null
@@ -108,4 +125,12 @@ PATH="$mock_bin:$PATH" FIXTURE_DIR="$fixture_dir" \
     "$repo_root/install.sh" --uninstall --install-dir "$install_dir" >/dev/null
 
 [ ! -e "$install_dir" ]
+
+draft_install_dir="$temp_dir/draft-install"
+if PATH="$mock_bin:$PATH" FIXTURE_DIR="$fixture_dir" MOCK_RELEASE_FILE=release-draft.json \
+    "$repo_root/install.sh" --version v0.1.0 --install-dir "$draft_install_dir" >/dev/null 2>&1; then
+    printf 'explicit draft release unexpectedly installed\n' >&2
+    exit 1
+fi
+[ ! -e "$draft_install_dir" ]
 printf 'POSIX installer lifecycle fixtures passed.\n'

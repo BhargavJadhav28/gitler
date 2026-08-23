@@ -61,20 +61,27 @@ jobs:
             ./target/release/gitler --help
           fi
 
-      - name: Parse PowerShell installer
+      - name: Validate PowerShell installer
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $tokens = $null
           $errors = $null
+          $installer = Join-Path $PWD 'install.ps1'
           [System.Management.Automation.Language.Parser]::ParseFile(
-            (Join-Path $PWD 'install.ps1'),
+            $installer,
             [ref]$tokens,
             [ref]$errors
           ) | Out-Null
           if ($errors.Count -ne 0) {
             $errors | ForEach-Object { $_.ToString() }
             exit 1
+          }
+
+          $installDir = Join-Path $env:RUNNER_TEMP ('gitler-installer-whatif-' + [guid]::NewGuid().ToString('N'))
+          & $installer -Version v0.1.0 -InstallDir $installDir -WhatIf
+          if (Test-Path -LiteralPath $installDir) {
+            throw "-WhatIf created install directory '$installDir'."
           }
 
   msrv:

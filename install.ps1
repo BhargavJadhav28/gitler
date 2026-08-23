@@ -557,6 +557,45 @@ function Assert-ReleaseAssetNames {
     }
 }
 
+function ConvertTo-ResolvedRelease {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Release,
+        [Parameter(Mandatory = $true)]
+        [string]$Description,
+        [AllowNull()]
+        [string]$ExpectedTag,
+        [Parameter(Mandatory = $true)]
+        [bool]$UsedLatestApi
+    )
+
+    $draft = Get-PropertyValue -Object $Release -Name 'draft'
+    $prerelease = Get-PropertyValue -Object $Release -Name 'prerelease'
+    if ($draft -ne $false -or $prerelease -ne $false) {
+        throw "$Description is draft or prerelease; refusing to install it."
+    }
+
+    $tag = Get-PropertyValue -Object $Release -Name 'tag_name'
+    if ($tag -isnot [string] -or -not (Test-StableVersion $tag)) {
+        throw "$Description has invalid stable tag '$tag'."
+    }
+
+    if (-not [string]::IsNullOrEmpty($ExpectedTag) -and $tag -cne $ExpectedTag) {
+        throw "$Description resolved tag '$tag', not requested tag '$ExpectedTag'."
+    }
+
+    $versionWithoutTag = $tag.Substring(1)
+    $expectedNames = Get-ExpectedAssetNames -VersionWithoutTag $versionWithoutTag
+    Assert-ReleaseAssetNames -Release $Release -ExpectedNames $expectedNames
+
+    return [pscustomobject][ordered]@{
+        Tag             = $tag
+        Version         = $versionWithoutTag
+        ExpectedAssets  = $expectedNames
+        UsedLatestApi   = $UsedLatestApi
+    }
+}
+
 function Resolve-Release {
     param(
         [AllowNull()]
@@ -570,54 +609,42 @@ function Resolve-Release {
             throw "Version '$RequestedVersion' is invalid. Use an exact stable tag such as v0.1.0."
         }
 
-        $versionWithoutTag = $RequestedVersion.Substring(1)
-        return [pscustomobject][ordered]@{
-            Tag             = $RequestedVersion
-            Version         = $versionWithoutTag
-            ExpectedAssets  = Get-ExpectedAssetNames -VersionWithoutTag $versionWithoutTag
-            UsedLatestApi   = $false
+        $escapedTag = [Uri]::EscapeDataString($RequestedVersion)
+        $apiUri = "https://api.github.com/repos/$RepositoryOwner/$RepositoryName/releases/tags/$escapedTag"
+        try {
+            $releaseJson = Invoke-HttpsRequest -Uri $apiUri -Json
         }
+        catch {
+            throw "Could not resolve requested gitler release '$RequestedVersion' over HTTPS. This may be a missing public release, GitHub API rate limit, proxy, TLS certificate, DNS, or network failure. Details: $($_.Exception.Message)"
+        }
+
+        try {
+            $release = ConvertFrom-Json -InputObject $releaseJson -ErrorAction Stop
+        }
+        catch {
+            throw "GitHub Release API for '$RequestedVersion' returned invalid JSON. Details: $($_.Exception.Message)"
+        }
+
+        return ConvertTo-ResolvedRelease -Release $release -Description "GitHub Release '$RequestedVersion'" -ExpectedTag $RequestedVersion -UsedLatestApi $false
     }
 
     $apiUri = "https://api.github.com/repos/$RepositoryOwner/$RepositoryName/releases/latest"
-    $latestJson = $null
     try {
         # This is the single latest-release lookup. All later requests use the tag URL.
-        $latestJson = Invoke-HttpsRequest -Uri $apiUri -Json
+        $releaseJson = Invoke-HttpsRequest -Uri $apiUri -Json
     }
     catch {
         throw "Could not resolve the latest stable gitler release over HTTPS. This may be a GitHub API rate limit, proxy, TLS certificate, DNS, or network failure. No latest-download fallback was attempted; rerun with -Version vX.Y.Z. Details: $($_.Exception.Message)"
     }
 
-    $release = $null
     try {
-        $release = ConvertFrom-Json -InputObject $latestJson -ErrorAction Stop
+        $release = ConvertFrom-Json -InputObject $releaseJson -ErrorAction Stop
     }
     catch {
         throw "GitHub latest release API returned invalid JSON. Details: $($_.Exception.Message)"
     }
 
-    $draft = Get-PropertyValue -Object $release -Name 'draft'
-    $prerelease = Get-PropertyValue -Object $release -Name 'prerelease'
-    if ($draft -ne $false -or $prerelease -ne $false) {
-        throw 'GitHub latest release is draft or prerelease; refusing to install it.'
-    }
-
-    $tag = Get-PropertyValue -Object $release -Name 'tag_name'
-    if ($tag -isnot [string] -or -not (Test-StableVersion $tag)) {
-        throw "GitHub latest release has invalid stable tag '$tag'."
-    }
-
-    $versionWithoutTag = $tag.Substring(1)
-    $expectedNames = Get-ExpectedAssetNames -VersionWithoutTag $versionWithoutTag
-    Assert-ReleaseAssetNames -Release $release -ExpectedNames $expectedNames
-
-    return [pscustomobject][ordered]@{
-        Tag             = $tag
-        Version         = $versionWithoutTag
-        ExpectedAssets  = $expectedNames
-        UsedLatestApi   = $true
-    }
+    return ConvertTo-ResolvedRelease -Release $release -Description 'GitHub latest release' -ExpectedTag $null -UsedLatestApi $true
 }
 
 function Get-TagDownloadUri {
