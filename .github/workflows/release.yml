@@ -36,7 +36,9 @@ jobs:
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
-          persist-credentials: false
+          # Preflight fetches the protected default branch and release tag.
+          # Builders keep credentials disabled below.
+          persist-credentials: true
 
       - name: Validate tag, ancestry, version, and release state
         id: validate
