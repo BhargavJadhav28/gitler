@@ -242,7 +242,8 @@ jobs:
         run: |
           set -euo pipefail
           test "$(uname -m)" = "$EXPECTED_UNAME"
-          rustc -vV | grep -Fqx "host: $TARGET"
+          rustc_version=$(rustc -vV)
+          printf '%s\n' "$rustc_version" | grep -Fqx "host: $TARGET"
           cargo fmt --check
           cargo clippy --target "$TARGET" --all-targets --all-features --locked -- -D warnings
           cargo test --target "$TARGET" --all-features --locked
@@ -258,7 +259,10 @@ jobs:
           test "$version_output" = "gitler $VERSION"
           "$PWD/$binary" --help >/dev/null
           file_output=$(file "$binary")
-          printf '%s\n' "$file_output" | grep -Fq "$EXPECTED_UNAME"
+          case "$file_output" in
+            *"$EXPECTED_UNAME"*) ;;
+            *) echo "unexpected macOS architecture: $file_output" >&2; exit 1 ;;
+          esac
           deployment_target=$(otool -l "$binary" | awk '
             /cmd LC_BUILD_VERSION/ { build = 1; macos = 0; next }
             build && /^Load command/ { build = 0; macos = 0 }
@@ -325,7 +329,8 @@ jobs:
         run: |
           set -euo pipefail
           test "$(uname -m)" = x86_64
-          rustc -vV | grep -Fqx "host: $TARGET"
+          rustc_version=$(rustc -vV)
+          printf '%s\n' "$rustc_version" | grep -Fqx "host: $TARGET"
           cargo fmt --check
           cargo clippy --target "$TARGET" --all-targets --all-features --locked -- -D warnings
           cargo test --target "$TARGET" --all-features --locked
@@ -341,9 +346,19 @@ jobs:
           test "$version_output" = "gitler $VERSION"
           "$PWD/$binary" --help >/dev/null
           file_output=$(file "$binary")
-          printf '%s\n' "$file_output" | grep -Eq 'ELF 64-bit.*x86-64'
-          readelf -h "$binary" | grep -Fq 'Class:                             ELF64'
-          readelf -h "$binary" | grep -Fq 'Machine:                           Advanced Micro Devices X86-64'
+          case "$file_output" in
+            *'ELF 64-bit'*'x86-64'*) ;;
+            *) echo "unexpected Linux architecture: $file_output" >&2; exit 1 ;;
+          esac
+          elf_header=$(readelf -h "$binary")
+          case "$elf_header" in
+            *'Class:                             ELF64'*) ;;
+            *) echo 'unexpected ELF class' >&2; exit 1 ;;
+          esac
+          case "$elf_header" in
+            *'Machine:                           Advanced Micro Devices X86-64'*) ;;
+            *) echo 'unexpected ELF machine' >&2; exit 1 ;;
+          esac
           interpreter=$(readelf -l "$binary" | awk '/Requesting program interpreter/ { gsub(/\]/, ""); print $NF }')
           case "$interpreter" in
             /lib64/ld-linux-x86-64.so.2|/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2) ;;
@@ -500,7 +515,8 @@ jobs:
             [[ "$actual_hash" == "$expected_hash" ]] || { echo "draft checksum mismatch: $asset_name" >&2; exit 1; }
           done < "$verify_dir/SHA256SUMS"
           chmod 755 "$verify_dir/gitler-v$VERSION-linux-x86_64-gnu"
-          "$verify_dir/gitler-v$VERSION-linux-x86_64-gnu" --version | grep -Fqx "gitler $VERSION"
+          version_output=$("$verify_dir/gitler-v$VERSION-linux-x86_64-gnu" --version)
+          [[ "$version_output" == "gitler $VERSION" ]]
           "$verify_dir/gitler-v$VERSION-linux-x86_64-gnu" --help >/dev/null
 
   publish:
