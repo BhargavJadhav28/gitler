@@ -79,7 +79,7 @@ jobs:
           }
 
           $installDir = Join-Path $env:RUNNER_TEMP ('gitler-installer-whatif-' + [guid]::NewGuid().ToString('N'))
-          & $installer -Version v0.1.0 -InstallDir $installDir -WhatIf
+          & $installer -Version v0.1.3 -InstallDir $installDir -WhatIf
           if (Test-Path -LiteralPath $installDir) {
             throw "-WhatIf created install directory '$installDir'."
           }
@@ -113,7 +113,7 @@ jobs:
           }
 
           $installDir = Join-Path $env:RUNNER_TEMP ('gitler-installer-ps51-whatif-' + [guid]::NewGuid().ToString('N'))
-          & $installer -Version v0.1.2 -InstallDir $installDir -WhatIf
+          & $installer -Version v0.1.3 -InstallDir $installDir -WhatIf
           if (Test-Path -LiteralPath $installDir) {
             throw "PowerShell 5.1 -WhatIf created install directory '$installDir'."
           }

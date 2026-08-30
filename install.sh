@@ -13,6 +13,10 @@ INSTALL_DIR_ARG=''
 FORCE=0
 ALLOW_DOWNGRADE=0
 MODIFY_PATH=0
+NO_MODIFY_PATH=0
+PATH_MODIFICATION_REQUIRED=0
+PATH_SETUP_ACTIVE=0
+PATH_SETUP_REASON=''
 REMOVE_PATH=0
 UNINSTALL=0
 DRY_RUN=0
@@ -26,6 +30,7 @@ PATH_PROFILE_TMP=''
 PATH_SNAPSHOT_FILE=''
 PATH_SNAPSHOT_PROFILE=''
 PATH_SNAPSHOT_EXISTS=0
+PATH_SNAPSHOT_READY=0
 BINARY_SWAP_COMMITTED=0
 STATE_COMMIT_DONE=0
 HAD_OLD_BINARY=0
@@ -58,7 +63,8 @@ Options:
   --install-dir DIR     Install into dedicated directory DIR
   --force               Replace a changed managed same-version binary
   --allow-downgrade     Permit installing an older managed version
-  --modify-path         Add the dedicated directory to a known shell profile
+  --modify-path         Require adding the dedicated directory to a known shell profile
+  --no-modify-path      Do not change shell profiles; print PATH commands instead
   --remove-path         Remove only this installer's unchanged PATH block
   --uninstall           Remove only this installer's managed installation
   --dry-run             Show actions without network, writes, or execution
@@ -69,6 +75,10 @@ EOF
 
 fail() {
     printf 'gitler installer: %s\n' "$1" >&2
+    if [ "$PATH_SETUP_ACTIVE" -eq 1 ] && [ "$PATH_MODIFICATION_REQUIRED" -eq 0 ]; then
+        PATH_SETUP_REASON=$1
+        print_path_fallback
+    fi
     exit 1
 }
 
@@ -98,7 +108,7 @@ cleanup() {
         rm -f "$ROLLBACK_FILE" ||
             printf 'gitler installer: could not remove temporary rollback copy %s\n' "$ROLLBACK_FILE" >&2
     fi
-    if [ -n "$PATH_SNAPSHOT_FILE" ] && [ -n "$PATH_SNAPSHOT_PROFILE" ]; then
+    if [ "$PATH_SNAPSHOT_READY" -eq 1 ] && [ -n "$PATH_SNAPSHOT_FILE" ] && [ -n "$PATH_SNAPSHOT_PROFILE" ]; then
         if [ "$PATH_SNAPSHOT_EXISTS" -eq 1 ]; then
             cp -p "$PATH_SNAPSHOT_FILE" "$PATH_SNAPSHOT_PROFILE" ||
                 printf 'gitler installer: interrupted PATH update could not restore %s\n' "$PATH_SNAPSHOT_PROFILE" >&2
@@ -177,6 +187,43 @@ compare_versions() {
 shell_quote() {
     escaped=$(printf '%s' "$1" | sed "s/'/'\\\\''/g")
     printf "'%s'" "$escaped"
+}
+
+path_shell_name() {
+    case "${SHELL:-}" in
+        */bash) printf '%s\n' bash ;;
+        */zsh) printf '%s\n' zsh ;;
+        */fish) printf '%s\n' fish ;;
+        *) printf '%s\n' unknown ;;
+    esac
+}
+
+print_path_commands() {
+    quoted=$(shell_quote "$INSTALL_DIR")
+    shell_name=$(path_shell_name)
+    case "$shell_name" in
+        bash|zsh)
+            printf 'For this terminal, run: export PATH=%s:"$PATH"\n' "$quoted"
+            printf 'To make it persistent, add that command to %s.\n' "$HOME/.${shell_name}rc"
+            ;;
+        fish)
+            printf 'For this terminal, run: fish_add_path --path --move %s\n' "$quoted"
+            printf 'Fish will persist that path for future sessions.\n'
+            ;;
+        *)
+            printf 'For this terminal, run: export PATH=%s:"$PATH"\n' "$quoted"
+            printf 'For future sessions, add the command above to your shell profile.\n'
+            ;;
+    esac
+}
+
+print_path_fallback() {
+    if [ -n "$PATH_SETUP_REASON" ]; then
+        printf 'Automatic PATH setup was not completed: %s\n' "$PATH_SETUP_REASON" >&2
+    else
+        printf 'PATH was not changed automatically.\n' >&2
+    fi
+    print_path_commands
 }
 
 assert_no_symlink_components() {
@@ -630,15 +677,17 @@ snapshot_path_profile() {
     PATH_SNAPSHOT_FILE="$TMP_DIR/path-profile.snapshot"
     PATH_SNAPSHOT_PROFILE=$profile
     PATH_SNAPSHOT_EXISTS=0
+    PATH_SNAPSHOT_READY=0
     if [ -e "$profile" ] || [ -L "$profile" ]; then
         [ -f "$profile" ] && [ ! -L "$profile" ] || fail "shell profile '$profile' is not a regular file"
         cp -p "$profile" "$PATH_SNAPSHOT_FILE" || fail "could not snapshot shell profile '$profile'"
         PATH_SNAPSHOT_EXISTS=1
     fi
+    PATH_SNAPSHOT_READY=1
 }
 
 restore_path_profile_snapshot() {
-    [ -n "$PATH_SNAPSHOT_FILE" ] || return 0
+    [ "$PATH_SNAPSHOT_READY" -eq 1 ] || return 0
     if [ "$PATH_SNAPSHOT_EXISTS" -eq 1 ]; then
         cp -p "$PATH_SNAPSHOT_FILE" "$PATH_SNAPSHOT_PROFILE" ||
             fail "could not restore shell profile '$PATH_SNAPSHOT_PROFILE'"
@@ -647,6 +696,39 @@ restore_path_profile_snapshot() {
     fi
     PATH_SNAPSHOT_FILE=''
     PATH_SNAPSHOT_PROFILE=''
+    PATH_SNAPSHOT_READY=0
+}
+
+configure_path() {
+    shell_name=$(path_shell_name)
+    if [ "$shell_name" = unknown ]; then
+        if [ "$PATH_MODIFICATION_REQUIRED" -eq 1 ]; then
+            fail 'unknown shell; PATH profile editing supports Bash, Zsh, and Fish only'
+        fi
+        PATH_SETUP_REASON="shell '${SHELL:-unknown}' is not supported for automatic profile editing"
+        return 0
+    fi
+
+    path_profile=$(path_profile_for_shell "$shell_name") || fail 'could not resolve shell profile for PATH management'
+    PATH_SETUP_ACTIVE=1
+    snapshot_path_profile "$path_profile"
+    append_path_block "$shell_name"
+    if ! write_state "$CURRENT_VERSION" "$CURRENT_ASSET" "$CURRENT_HASH" "$CURRENT_PATH_SHELL" "$CURRENT_PATH_FILE" "$CURRENT_PATH_HASH"; then
+        CURRENT_PATH_SHELL='none'
+        CURRENT_PATH_FILE=''
+        CURRENT_PATH_HASH=''
+        restore_path_profile_snapshot
+        PATH_SETUP_ACTIVE=0
+        if [ "$PATH_MODIFICATION_REQUIRED" -eq 1 ]; then
+            fail 'installer state update failed; PATH block was restored'
+        fi
+        PATH_SETUP_REASON='installer state update failed; PATH block was restored'
+        return 0
+    fi
+    PATH_SETUP_ACTIVE=0
+    PATH_SNAPSHOT_FILE=''
+    PATH_SNAPSHOT_PROFILE=''
+    PATH_SNAPSHOT_READY=0
 }
 
 write_state_contents() {
@@ -707,26 +789,14 @@ commit_prepared_state() {
 }
 
 print_path_instructions() {
-    quoted=$(shell_quote "$INSTALL_DIR")
     printf 'Installed %s %s at %s\n' "$PROGRAM" "$RESOLVED_VERSION" "$BINARY_PATH"
-    if [ "$MODIFY_PATH" -eq 1 ]; then
-        printf 'PATH block added to %s. Open a new terminal or source that profile.\n' "$CURRENT_PATH_FILE"
+    if [ "$MODIFY_PATH" -eq 1 ] && [ "$CURRENT_PATH_SHELL" != none ] && [ -z "$PATH_SETUP_REASON" ]; then
+        printf 'PATH is configured in %s.\n' "$CURRENT_PATH_FILE"
+        print_path_commands
+        printf 'Open a new terminal or source that profile before using %s by name.\n' "$PROGRAM"
         return
     fi
-    printf "Current terminal: export PATH=%s:\"\$PATH\"\n" "$quoted"
-    case "${SHELL:-}" in
-        */bash) shell_name=bash ;;
-        */zsh) shell_name=zsh ;;
-        */fish) shell_name=fish ;;
-        *) shell_name=unknown ;;
-    esac
-    case "$shell_name" in
-        bash) printf "Persistent Bash command: export PATH=%s:\"\$PATH\"  # add to ~/.bashrc\n" "$quoted" ;;
-        zsh) printf "Persistent Zsh command: export PATH=%s:\"\$PATH\"  # add to ~/.zshrc\n" "$quoted" ;;
-        fish) printf 'Persistent Fish command: fish_add_path --path --move %s\n' "$quoted" ;;
-        *) printf 'Persistent PATH: add %s to your shell profile manually; unknown shell is not edited.\n' "$quoted" ;;
-    esac
-    printf 'Open a new terminal or source the relevant profile before using %s by name.\n' "$PROGRAM"
+    print_path_fallback
 }
 
 parse_args() {
@@ -744,7 +814,8 @@ parse_args() {
                 ;;
             --force) FORCE=1; shift ;;
             --allow-downgrade) ALLOW_DOWNGRADE=1; shift ;;
-            --modify-path) MODIFY_PATH=1; shift ;;
+            --modify-path) MODIFY_PATH=1; PATH_MODIFICATION_REQUIRED=1; shift ;;
+            --no-modify-path) NO_MODIFY_PATH=1; shift ;;
             --remove-path) REMOVE_PATH=1; shift ;;
             --uninstall) UNINSTALL=1; shift ;;
             --dry-run) DRY_RUN=1; shift ;;
@@ -752,6 +823,13 @@ parse_args() {
             *) fail "unknown option '$1'" ;;
         esac
     done
+    [ "$MODIFY_PATH" -eq 0 ] || [ "$NO_MODIFY_PATH" -eq 0 ] || fail '--modify-path and --no-modify-path cannot be combined'
+    if [ "$NO_MODIFY_PATH" -eq 0 ] && [ "$MODIFY_PATH" -eq 0 ] && [ "$UNINSTALL" -eq 0 ] && [ "$REMOVE_PATH" -eq 0 ]; then
+        MODIFY_PATH=1
+    fi
+    if [ "$NO_MODIFY_PATH" -eq 1 ]; then
+        PATH_SETUP_REASON='disabled with --no-modify-path'
+    fi
     [ "$MODIFY_PATH" -eq 0 ] || [ "$REMOVE_PATH" -eq 0 ] || fail '--modify-path and --remove-path cannot be combined'
     [ "$UNINSTALL" -eq 0 ] || [ "$FORCE" -eq 0 ] || fail '--force cannot be combined with --uninstall'
     [ "$UNINSTALL" -eq 0 ] || [ "$ALLOW_DOWNGRADE" -eq 0 ] || fail '--allow-downgrade cannot be combined with --uninstall'
@@ -776,9 +854,17 @@ if [ "$DRY_RUN" -eq 1 ]; then
                 *) fail "version '$REQUESTED_VERSION' must start with v" ;;
             esac
             validate_version "$dry_version"
-            printf 'Dry run: install gitler %s for the detected native platform into %s; no network, writes, or execution.\n' "$dry_version" "$INSTALL_DIR"
+            if [ "$MODIFY_PATH" -eq 1 ]; then
+                printf 'Dry run: install gitler %s into %s and attempt automatic PATH setup; no network, writes, or execution.\n' "$dry_version" "$INSTALL_DIR"
+            else
+                printf 'Dry run: install gitler %s into %s without changing PATH; no network, writes, or execution.\n' "$dry_version" "$INSTALL_DIR"
+            fi
         else
-            printf 'Dry run: resolve one latest stable release, then install the detected native platform into %s; no network, writes, or execution.\n' "$INSTALL_DIR"
+            if [ "$MODIFY_PATH" -eq 1 ]; then
+                printf 'Dry run: resolve one latest stable release, install the detected native platform into %s, and attempt automatic PATH setup; no network, writes, or execution.\n' "$INSTALL_DIR"
+            else
+                printf 'Dry run: resolve one latest stable release, then install the detected native platform into %s without changing PATH; no network, writes, or execution.\n' "$INSTALL_DIR"
+            fi
         fi
     fi
     exit 0
@@ -827,6 +913,7 @@ if [ "$REMOVE_PATH" -eq 1 ] && [ "$MANAGED_INSTALL" -eq 1 ]; then
     fi
     PATH_SNAPSHOT_FILE=''
     PATH_SNAPSHOT_PROFILE=''
+    PATH_SNAPSHOT_READY=0
     printf 'Removed unchanged installer PATH block.\n'
     exit 0
 fi
@@ -868,25 +955,7 @@ if [ "$MANAGED_INSTALL" -eq 1 ]; then
     if [ "$comparison" -eq 0 ] && [ "$CURRENT_HASH" = "$actual_hash" ] && [ "$FORCE" -eq 0 ]; then
         RESOLVED_VERSION="$CURRENT_VERSION"
         if [ "$MODIFY_PATH" -eq 1 ] && [ "$CURRENT_PATH_SHELL" = none ]; then
-            case "${SHELL:-}" in
-                */bash) shell_name=bash ;;
-                */zsh) shell_name=zsh ;;
-                */fish) shell_name=fish ;;
-                *) shell_name=unknown ;;
-            esac
-            [ "$shell_name" != unknown ] || fail 'unknown shell; PATH profile editing supports Bash, Zsh, and Fish only'
-            path_profile=$(path_profile_for_shell "$shell_name") || fail 'could not resolve shell profile for PATH management'
-            snapshot_path_profile "$path_profile"
-            append_path_block "$shell_name"
-            if ! write_state "$CURRENT_VERSION" "$CURRENT_ASSET" "$CURRENT_HASH" "$CURRENT_PATH_SHELL" "$CURRENT_PATH_FILE" "$CURRENT_PATH_HASH"; then
-                CURRENT_PATH_SHELL='none'
-                CURRENT_PATH_FILE=''
-                CURRENT_PATH_HASH=''
-                restore_path_profile_snapshot
-                fail 'installer state update failed; PATH block was restored'
-            fi
-            PATH_SNAPSHOT_FILE=''
-            PATH_SNAPSHOT_PROFILE=''
+            configure_path
         fi
         print_path_instructions
         printf 'Existing managed binary already matches this release; no replacement needed.\n'
@@ -954,22 +1023,7 @@ CURRENT_VERSION=$RESOLVED_VERSION
 CURRENT_ASSET=$ASSET_NAME
 CURRENT_HASH=$actual_hash
 if [ "$MODIFY_PATH" -eq 1 ] && [ "$CURRENT_PATH_SHELL" = none ]; then
-    case "${SHELL:-}" in
-        */bash) shell_name=bash ;;
-        */zsh) shell_name=zsh ;;
-        */fish) shell_name=fish ;;
-        *) shell_name=unknown ;;
-    esac
-    [ "$shell_name" != unknown ] || fail 'unknown shell; PATH profile editing supports Bash, Zsh, and Fish only'
-    path_profile=$(path_profile_for_shell "$shell_name") || fail 'could not resolve shell profile for PATH management'
-    snapshot_path_profile "$path_profile"
-    append_path_block "$shell_name"
-    if ! write_state "$CURRENT_VERSION" "$CURRENT_ASSET" "$CURRENT_HASH" "$CURRENT_PATH_SHELL" "$CURRENT_PATH_FILE" "$CURRENT_PATH_HASH"; then
-        restore_path_profile_snapshot
-        fail 'installer state update failed; PATH block was restored'
-    fi
-    PATH_SNAPSHOT_FILE=''
-    PATH_SNAPSHOT_PROFILE=''
+    configure_path
 fi
 
 print_path_instructions

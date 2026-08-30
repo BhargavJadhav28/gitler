@@ -93,7 +93,7 @@ EOF
 sed 's/"draft":false/"draft":true/' "$fixture_dir/release.json" > "$fixture_dir/release-draft.json"
 
 PATH="$mock_bin:$PATH" HOME="$home_dir" SHELL=/bin/bash FIXTURE_DIR="$fixture_dir" \
-    "$repo_root/install.sh" --version v0.1.0 --modify-path --install-dir "$install_dir" >/dev/null
+    "$repo_root/install.sh" --version v0.1.0 --install-dir "$install_dir" >/dev/null
 
 test -f "$install_dir/gitler"
 test -f "$home_dir/.bashrc"
@@ -138,9 +138,30 @@ latest_install_dir="$temp_dir/latest-install"
 PATH="$mock_bin:$PATH" HOME="$home_dir" SHELL=/bin/bash FIXTURE_DIR="$fixture_dir" \
     "$repo_root/install.sh" --install-dir "$latest_install_dir" >/dev/null
 test -f "$latest_install_dir/gitler"
-PATH="$mock_bin:$PATH" FIXTURE_DIR="$fixture_dir" \
-    "$repo_root/install.sh" --uninstall --install-dir "$latest_install_dir" >/dev/null
+PATH="$mock_bin:$PATH" HOME="$home_dir" SHELL=/bin/bash FIXTURE_DIR="$fixture_dir" \
+    "$repo_root/install.sh" --uninstall --remove-path --install-dir "$latest_install_dir" >/dev/null
 [ ! -e "$latest_install_dir" ]
+
+no_path_dir="$temp_dir/no-path-install"
+no_path_home="$temp_dir/no-path-home"
+mkdir -p "$no_path_home"
+no_path_output=$(PATH="$mock_bin:$PATH" HOME="$no_path_home" SHELL=/bin/bash FIXTURE_DIR="$fixture_dir" \
+    "$repo_root/install.sh" --no-modify-path --install-dir "$no_path_dir" 2>&1)
+printf '%s\n' "$no_path_output" | grep -Fq 'For this terminal, run: export PATH='
+[ ! -e "$no_path_home/.bashrc" ]
+PATH="$mock_bin:$PATH" FIXTURE_DIR="$fixture_dir" \
+    "$repo_root/install.sh" --uninstall --install-dir "$no_path_dir" >/dev/null
+
+fallback_dir="$temp_dir/fallback-install"
+fallback_home="$temp_dir/fallback-home"
+mkdir -p "$fallback_home"
+fallback_output=$(PATH="$mock_bin:$PATH" HOME="$fallback_home" SHELL=/bin/unknown FIXTURE_DIR="$fixture_dir" \
+    "$repo_root/install.sh" --install-dir "$fallback_dir" 2>&1)
+printf '%s\n' "$fallback_output" | grep -Fq 'Automatic PATH setup was not completed'
+printf '%s\n' "$fallback_output" | grep -Fq 'For this terminal, run: export PATH='
+[ ! -e "$fallback_home/.bashrc" ]
+PATH="$mock_bin:$PATH" FIXTURE_DIR="$fixture_dir" \
+    "$repo_root/install.sh" --uninstall --install-dir "$fallback_dir" >/dev/null
 
 real_parent="$temp_dir/real-parent"
 symlink_parent="$temp_dir/symlink-parent"

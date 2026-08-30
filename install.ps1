@@ -5,6 +5,7 @@ param(
     [switch]$Force,
     [switch]$AllowDowngrade,
     [switch]$AddToPath,
+    [switch]$NoAddToPath,
     [switch]$RemovePath,
     [switch]$Uninstall
 )
@@ -1222,6 +1223,26 @@ function Update-CurrentProcessPath {
     }
 }
 
+function Write-PathInstructions {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$InstallDirectory,
+        [AllowNull()]
+        [string]$Reason
+    )
+
+    if (-not [string]::IsNullOrEmpty($Reason)) {
+        Write-Warning "Automatic User PATH setup was not completed: $Reason"
+    }
+    else {
+        Write-Output 'PATH was not changed automatically.'
+    }
+
+    $quotedDirectory = $InstallDirectory.Replace("'", "''")
+    Write-Output "For the current PowerShell session, run: `$env:Path = '$quotedDirectory;' + `$env:Path"
+    Write-Output 'To persist PATH setup, rerun the downloaded installer with -AddToPath.'
+}
+
 function Broadcast-EnvironmentChange {
     try {
         $typeName = [System.Management.Automation.PSTypeName]'GitlerInstallerNativeMethods'
@@ -1549,6 +1570,10 @@ function Get-TargetWindowsArchitecture {
 $hasExplicitVersion = $PSBoundParameters.ContainsKey('Version')
 $hasExplicitInstallDirectory = $PSBoundParameters.ContainsKey('InstallDir')
 
+if ($AddToPath -and $NoAddToPath) {
+    throw 'AddToPath and NoAddToPath cannot be used together.'
+}
+
 if ($AddToPath -and $RemovePath) {
     throw 'AddToPath and RemovePath cannot be used together.'
 }
@@ -1566,6 +1591,9 @@ if ($Uninstall) {
         throw 'Uninstall cannot be combined with Version, Force, AllowDowngrade, or AddToPath. Use RemovePath explicitly when PATH removal is wanted.'
     }
 }
+
+$shouldAddToPath = (-not [bool]$NoAddToPath) -and (-not [bool]$Uninstall) -and (-not [bool]$RemovePath)
+$pathConfigurationRequired = [bool]$AddToPath
 
 if ($hasExplicitVersion -and -not (Test-StableVersion $Version)) {
     throw "Version '$Version' is invalid. Use an exact stable tag such as v0.1.0."
@@ -1780,7 +1808,9 @@ try {
         }
     }
 
-    $pathPlan = Get-PathPlan -InstallDirectory $normalizedInstallDirectory -StatePathAdded $(if ($stateExists) { [bool]$state.PathAdded } else { $false }) -ForAdd ([bool]$AddToPath) -ForRemove ([bool]$RemovePath)
+    $statePathAdded = if ($stateExists) { [bool]$state.PathAdded } else { $false }
+    $pathSetupFailureReason = $null
+    $pathPlan = Get-PathPlan -InstallDirectory $normalizedInstallDirectory -StatePathAdded $statePathAdded -ForAdd ([bool]$shouldAddToPath) -ForRemove ([bool]$RemovePath)
     $newState = New-StateObject -VersionWithoutTag $resolvedVersion -AssetName $assetName -Sha256 $downloadedHash -PathAdded ([bool]$pathPlan.DesiredOwnership) -InstallDirectory $normalizedInstallDirectory
 
     if (-not $needsExecutableReplacement) {
@@ -1789,6 +1819,9 @@ try {
 
     if (-not $needsExecutableReplacement -and -not $pathPlan.Changed -and $pathPlan.ProcessAction -eq 'None' -and ([bool]$pathPlan.DesiredOwnership -eq [bool]$state.PathAdded)) {
         Write-Output "gitler v$resolvedVersion is already installed at '$destinationPath'; verified hash matches, so no changes were made."
+        if (-not $shouldAddToPath -and -not [bool]$statePathAdded) {
+            Write-PathInstructions -InstallDirectory $normalizedInstallDirectory -Reason $null
+        }
         $installationCommitted = $true
         return
     }
@@ -1822,8 +1855,19 @@ try {
         }
 
         if ($pathPlan.Changed) {
-            Set-UserPathValue -Value $pathPlan.NewValue
-            $userPathChanged = $true
+            try {
+                Set-UserPathValue -Value $pathPlan.NewValue
+                $userPathChanged = $true
+            }
+            catch {
+                if ($pathConfigurationRequired) {
+                    throw
+                }
+
+                $pathSetupFailureReason = $_.Exception.Message
+                $pathPlan = Get-PathPlan -InstallDirectory $normalizedInstallDirectory -StatePathAdded $statePathAdded -ForAdd $false -ForRemove $false
+                $newState = New-StateObject -VersionWithoutTag $resolvedVersion -AssetName $assetName -Sha256 $downloadedHash -PathAdded ([bool]$pathPlan.DesiredOwnership) -InstallDirectory $normalizedInstallDirectory
+            }
         }
 
         $stateTransaction = Write-StateFile -State $newState -StatePath $statePath -PreviouslyExisted $stateExists
@@ -1890,25 +1934,26 @@ try {
         throw "Installation failed: $failure The previous installation was restored where possible."
     }
 
-    if ($pathPlan.ProcessAction -eq 'Add') {
-        Write-Output "Installed gitler v$resolvedVersion at '$destinationPath'."
-        if ($pathPlan.DesiredOwnership) {
-            if ($pathPlan.Changed) {
-                Write-Output "Added '$normalizedInstallDirectory' to User PATH. Open a new terminal for other processes to observe the change."
-            }
-            else {
-                Write-Output 'User PATH already contains the exact install directory.'
-            }
+    Write-Output "Installed gitler v$resolvedVersion at '$destinationPath'."
+    if ($null -ne $pathSetupFailureReason) {
+        Write-PathInstructions -InstallDirectory $normalizedInstallDirectory -Reason $pathSetupFailureReason
+    }
+    elseif ($pathPlan.DesiredOwnership) {
+        if ($pathPlan.ProcessAction -eq 'Add' -and $pathPlan.Changed) {
+            Write-Output "Added '$normalizedInstallDirectory' to User PATH. Open a new terminal for other processes to observe the change."
+        }
+        elseif ($pathPlan.ProcessAction -eq 'Add') {
+            Write-Output 'User PATH already contains the exact install directory.'
+        }
+        else {
+            Write-Output 'The installer-owned User PATH entry remains configured.'
         }
     }
-    elseif ($pathPlan.ProcessAction -eq 'Remove') {
-        Write-Output "Installed gitler v$resolvedVersion at '$destinationPath'."
-        if ($pathPlan.Changed) {
-            Write-Output "Removed the exact installer-owned directory from User PATH. Open a new terminal for other processes to observe the change."
-        }
+    elseif (-not $shouldAddToPath) {
+        Write-PathInstructions -InstallDirectory $normalizedInstallDirectory -Reason $null
     }
-    else {
-        Write-Output "Installed gitler v$resolvedVersion at '$destinationPath'."
+    elseif ($pathPlan.ProcessAction -eq 'Add') {
+        Write-Output 'User PATH already contains the exact install directory; it was not claimed by the installer.'
     }
 }
 finally {

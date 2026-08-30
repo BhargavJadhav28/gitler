@@ -4,6 +4,11 @@ All notable changes to `gitler` are documented here.
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-08-30
+
+- Automatically configure PATH on normal installs when the shell supports it.
+- Added `--no-modify-path` and `-NoAddToPath` opt-outs with copy-paste fallback commands.
+
 ## [0.1.2] - 2026-08-30
 
 - Fixed PowerShell installer execution through `irm | iex`.
