@@ -23,7 +23,7 @@ currently supported.
 ### Recommended: download, inspect, install
 
 Download the installer before running it so you can inspect its contents.
-Replace `v0.1.0` with the exact release you want.
+Examples use `v0.1.2`; replace it with the exact release you want.
 
 Unix:
 
@@ -40,7 +40,7 @@ For an exact version, download the script from its tag and pass the same tag to
 it. This avoids the GitHub latest-release API lookup:
 
 ```sh
-version=v0.1.0
+version=v0.1.2
 mkdir -p "$HOME/Downloads/gitler-installer"
 curl --proto '=https' --proto-redir '=https' -fsSL \
   "https://github.com/BhargavJadhav28/gitler/releases/download/$version/install.sh" \
@@ -62,7 +62,7 @@ Get-Content -LiteralPath $installer
 Exact-version PowerShell install:
 
 ```powershell
-$version = 'v0.1.0'
+$version = 'v0.1.2'
 $installer = Join-Path $env:TEMP 'gitler-install.ps1'
 Invoke-WebRequest `
   -Uri "https://github.com/BhargavJadhav28/gitler/releases/download/$version/install.ps1" `
@@ -131,7 +131,7 @@ manifest entry.
 Linux example:
 
 ```sh
-version=v0.1.0
+version=v0.1.2
 asset="gitler-${version}-linux-x86_64-gnu"
 base="https://github.com/BhargavJadhav28/gitler/releases/download/$version"
 curl --proto '=https' --proto-redir '=https' -fL "$base/$asset" -o "$asset"
@@ -152,7 +152,7 @@ Stable assets also receive GitHub artifact attestations. After authenticating
 GitHub CLI, verify the exact downloaded file against this repository:
 
 ```sh
-gh attestation verify ./gitler-v0.1.0-linux-x86_64-gnu \
+gh attestation verify ./gitler-v0.1.2-linux-x86_64-gnu \
   -R BhargavJadhav28/gitler
 ```
 

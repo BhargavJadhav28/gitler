@@ -21,6 +21,14 @@ TMP_DIR=''
 STATE_TMP_FILE=''
 STAGE_FILE=''
 ROLLBACK_FILE=''
+ROLLBACK_RESTORE_FAILED=0
+PATH_PROFILE_TMP=''
+PATH_SNAPSHOT_FILE=''
+PATH_SNAPSHOT_PROFILE=''
+PATH_SNAPSHOT_EXISTS=0
+BINARY_SWAP_COMMITTED=0
+STATE_COMMIT_DONE=0
+HAD_OLD_BINARY=0
 HASH_TOOL=''
 INSTALL_DIR=''
 BINARY_PATH=''
@@ -73,8 +81,34 @@ cleanup() {
     if [ -n "$STAGE_FILE" ] && [ -e "$STAGE_FILE" ]; then
         rm -f "$STAGE_FILE"
     fi
-    if [ -n "$ROLLBACK_FILE" ] && [ -e "$ROLLBACK_FILE" ]; then
-        rm -f "$ROLLBACK_FILE"
+    if [ "$BINARY_SWAP_COMMITTED" -eq 1 ] && [ "$STATE_COMMIT_DONE" -eq 0 ]; then
+        if [ "$HAD_OLD_BINARY" -eq 1 ] && [ -n "$ROLLBACK_FILE" ] && [ -e "$ROLLBACK_FILE" ]; then
+            if mv -f "$ROLLBACK_FILE" "$BINARY_PATH"; then
+                ROLLBACK_FILE=''
+            else
+                ROLLBACK_RESTORE_FAILED=1
+                printf 'gitler installer: interrupted update could not restore %s; rollback copy was retained at %s\n' "$BINARY_PATH" "$ROLLBACK_FILE" >&2
+            fi
+        elif [ "$HAD_OLD_BINARY" -eq 0 ] && [ -f "$BINARY_PATH" ] && [ ! -L "$BINARY_PATH" ]; then
+            rm -f "$BINARY_PATH" ||
+                printf 'gitler installer: interrupted first install could not remove %s\n' "$BINARY_PATH" >&2
+        fi
+    fi
+    if [ "$ROLLBACK_RESTORE_FAILED" -eq 0 ] && [ -n "$ROLLBACK_FILE" ] && [ -e "$ROLLBACK_FILE" ]; then
+        rm -f "$ROLLBACK_FILE" ||
+            printf 'gitler installer: could not remove temporary rollback copy %s\n' "$ROLLBACK_FILE" >&2
+    fi
+    if [ -n "$PATH_SNAPSHOT_FILE" ] && [ -n "$PATH_SNAPSHOT_PROFILE" ]; then
+        if [ "$PATH_SNAPSHOT_EXISTS" -eq 1 ]; then
+            cp -p "$PATH_SNAPSHOT_FILE" "$PATH_SNAPSHOT_PROFILE" ||
+                printf 'gitler installer: interrupted PATH update could not restore %s\n' "$PATH_SNAPSHOT_PROFILE" >&2
+        else
+            rm -f "$PATH_SNAPSHOT_PROFILE" ||
+                printf 'gitler installer: interrupted PATH update could not remove %s\n' "$PATH_SNAPSHOT_PROFILE" >&2
+        fi
+    fi
+    if [ -n "$PATH_PROFILE_TMP" ] && [ -e "$PATH_PROFILE_TMP" ]; then
+        rm -f "$PATH_PROFILE_TMP"
     fi
     if [ -n "$TMP_DIR" ] && [ -d "$TMP_DIR" ]; then
         rm -rf "$TMP_DIR"
@@ -145,6 +179,25 @@ shell_quote() {
     printf "'%s'" "$escaped"
 }
 
+assert_no_symlink_components() {
+    path=$1
+    while :; do
+        if [ -L "$path" ]; then
+            fail "refusing symlinked path component '$path'"
+        fi
+        [ "$path" = '/' ] && break
+        case "$path" in
+            */*)
+                parent=${path%/*}
+                [ -n "$parent" ] || parent=/
+                ;;
+            *) break ;;
+        esac
+        [ "$parent" = "$path" ] && break
+        path=$parent
+    done
+}
+
 resolve_install_dir() {
     if [ -n "$INSTALL_DIR_ARG" ]; then
         case "$INSTALL_DIR_ARG" in
@@ -167,6 +220,19 @@ resolve_install_dir() {
         fi
     fi
     [ -n "$INSTALL_DIR" ] || fail 'install directory cannot be empty'
+    case "$INSTALL_DIR" in
+        *[![:print:]]*) fail 'install directory cannot contain control characters' ;;
+        */../*|*/..|*/./*|*/.) fail 'install directory cannot contain . or .. path components' ;;
+    esac
+    while [ "$INSTALL_DIR" != '/' ] && [ "${INSTALL_DIR%/}" != "$INSTALL_DIR" ]; do
+        INSTALL_DIR=${INSTALL_DIR%/}
+    done
+    if [ "$MODIFY_PATH" -eq 1 ] || [ "$REMOVE_PATH" -eq 1 ]; then
+        case "$INSTALL_DIR" in
+            *:*) fail 'PATH management cannot use an install directory containing a colon' ;;
+        esac
+    fi
+    assert_no_symlink_components "$INSTALL_DIR"
     BINARY_PATH="$INSTALL_DIR/$PROGRAM"
     STATE_PATH="$INSTALL_DIR/$INSTALL_STATE"
 }
@@ -205,19 +271,25 @@ select_platform() {
 json_string_value() {
     key=$1
     file=$2
-    tr ',' '\n' < "$file" | sed -n "s/.*\"$key\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -n 1
+    tr ',{' '\n' < "$file" |
+        sed -n "s/^[[:space:]]*\"$key\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*$/\1/p" |
+        head -n 1
 }
 
 json_boolean_value() {
     key=$1
     file=$2
-    tr ',' '\n' < "$file" | sed -n "s/.*\"$key\"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p" | head -n 1
+    tr ',{' '\n' < "$file" |
+        sed -n "s/^[[:space:]]*\"$key\"[[:space:]]*:[[:space:]]*\(true\|false\).*$/\1/p" |
+        head -n 1
 }
 
 contains_asset_name() {
     name=$1
     file=$2
-    grep -Fq "\"name\": \"$name\"" "$file" || grep -Fq "\"name\":\"$name\"" "$file"
+    tr ',{' '\n' < "$file" |
+        sed -n 's/^[[:space:]]*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*$/\1/p' |
+        grep -Fqx "$name"
 }
 
 validate_release_metadata() {
@@ -249,10 +321,11 @@ validate_release_metadata() {
 resolve_latest_release() {
     latest_file=$TMP_DIR/latest.json
     status_file=$TMP_DIR/latest.status
-    if ! curl -qfsSL --proto '=https' --proto-redir '=https' \
-        --connect-timeout 20 --max-time 60 \
+    if ! curl -qsSL --proto '=https' --proto-redir '=https' \
+        --connect-timeout 20 --max-time 60 --retry 2 --retry-delay 1 \
+        -H 'Accept: application/vnd.github+json' \
         -o "$latest_file" -w '%{http_code}' "$LATEST_API" > "$status_file"; then
-        fail "latest release lookup failed; rerun with --version vX.Y.Z if GitHub API is rate-limited or unavailable"
+        fail "latest release lookup failed; check HTTPS access, proxy settings, and DNS; rerun with --version vX.Y.Z"
     fi
     status=$(cat "$status_file")
     case "$status" in
@@ -269,10 +342,11 @@ resolve_exact_release() {
     release_file=$TMP_DIR/release.json
     status_file=$TMP_DIR/release.status
     release_api="$RELEASES_API/tags/$requested_tag"
-    if ! curl -qfsSL --proto '=https' --proto-redir '=https' \
-        --connect-timeout 20 --max-time 60 \
+    if ! curl -qsSL --proto '=https' --proto-redir '=https' \
+        --connect-timeout 20 --max-time 60 --retry 2 --retry-delay 1 \
+        -H 'Accept: application/vnd.github+json' \
         -o "$release_file" -w '%{http_code}' "$release_api" > "$status_file"; then
-        fail "release lookup for '$requested_tag' failed; check GitHub access and retry"
+        fail "release lookup for '$requested_tag' failed; check HTTPS access, proxy settings, and DNS"
     fi
     status=$(cat "$status_file")
     case "$status" in
@@ -369,6 +443,8 @@ validate_state() {
     CURRENT_VERSION=$(state_value installed_version) || fail 'installed version is unreadable'
     validate_version "$CURRENT_VERSION"
     CURRENT_ASSET=$(state_value asset_filename) || fail 'installed asset name is unreadable'
+    [ "$CURRENT_ASSET" = "gitler-v${CURRENT_VERSION}-${ASSET_SUFFIX}" ] ||
+        fail 'installed asset name does not match the selected native platform'
     CURRENT_HASH=$(state_value binary_sha256) || fail 'installed binary hash is unreadable'
     printf '%s\n' "$CURRENT_HASH" | grep -Eq '^[0-9a-f]{64}$' || fail 'installed binary hash is malformed'
     CURRENT_PATH_SHELL=$(state_value path_shell) || fail 'PATH ownership state is unreadable'
@@ -382,6 +458,10 @@ validate_state() {
             ;;
         bash|zsh|fish)
             [ -n "$CURRENT_PATH_FILE" ] || fail 'PATH ownership has no profile path'
+            case "$CURRENT_PATH_FILE" in
+                /*) ;;
+                *) fail 'PATH ownership profile path must be absolute' ;;
+            esac
             printf '%s\n' "$CURRENT_PATH_HASH" | grep -Eq '^[0-9a-f]{64}$' || fail 'PATH block hash is malformed'
             ;;
         *) fail 'PATH ownership shell is unsupported' ;;
@@ -447,6 +527,7 @@ append_path_block() {
     case "$profile" in
         *[![:print:]]*) fail 'shell profile path contains control characters' ;;
     esac
+    assert_no_symlink_components "$profile"
     if [ -L "$profile" ]; then
         fail "refusing to edit symlinked shell profile '$profile'"
     fi
@@ -462,14 +543,19 @@ append_path_block() {
     if [ -f "$profile" ] && grep -Fq '# >>> gitler installer PATH (do not edit) >>>' "$profile"; then
         fail "PATH block already exists in '$profile'; refusing to create a duplicate"
     fi
-    profile_tmp=$TMP_DIR/profile.tmp
-    if [ -f "$profile" ]; then
-        cp -p "$profile" "$profile_tmp"
-    else
-        : > "$profile_tmp"
+    profile_tmp="$profile.gitler.tmp.$$"
+    if [ -e "$profile_tmp" ] || [ -L "$profile_tmp" ]; then
+        fail "temporary shell profile path already exists '$profile_tmp'"
     fi
-    cat "$block" >> "$profile_tmp"
-    mv "$profile_tmp" "$profile"
+    PATH_PROFILE_TMP=$profile_tmp
+    if [ -f "$profile" ]; then
+        cp -p "$profile" "$profile_tmp" || fail "could not stage shell profile '$profile'"
+    else
+        : > "$profile_tmp" || fail "could not create shell profile '$profile'"
+    fi
+    cat "$block" >> "$profile_tmp" || fail "could not append PATH block for '$profile'"
+    mv "$profile_tmp" "$profile" || fail "could not atomically update shell profile '$profile'"
+    PATH_PROFILE_TMP=''
 
     CURRENT_PATH_SHELL=$shell
     CURRENT_PATH_FILE=$profile
@@ -481,6 +567,10 @@ remove_path_block() {
     profile=$CURRENT_PATH_FILE
     expected_profile=$(path_profile_for_shell "$CURRENT_PATH_SHELL") || fail 'PATH ownership shell is unsupported'
     [ "$profile" = "$expected_profile" ] || fail 'PATH ownership points outside the supported user profile location'
+    case "$profile" in
+        *[![:print:]]*) fail 'shell profile path contains control characters' ;;
+    esac
+    assert_no_symlink_components "$profile"
     if [ ! -f "$profile" ] || [ -L "$profile" ]; then
         fail "owned PATH profile '$profile' is missing or is not a regular file"
     fi
@@ -491,8 +581,12 @@ remove_path_block() {
     [ "$block_hash" = "$CURRENT_PATH_HASH" ] || fail 'generated PATH block no longer matches installer state'
 
     found_block=$TMP_DIR/found-path-block
-    filtered=$TMP_DIR/profile.filtered
+    filtered="$profile.gitler.filtered.$$"
+    if [ -e "$filtered" ] || [ -L "$filtered" ]; then
+        fail "temporary shell profile path already exists '$filtered'"
+    fi
     : > "$found_block"
+    PATH_PROFILE_TMP=$filtered
     : > "$filtered"
     if ! awk \
         -v start='# >>> gitler installer PATH (do not edit) >>>' \
@@ -524,15 +618,40 @@ remove_path_block() {
     fi
     [ "$(hash_file "$found_block")" = "$CURRENT_PATH_HASH" ] ||
         fail 'PATH marker block was edited; refusing to remove user-edited content'
-    mv "$filtered" "$profile"
+    mv "$filtered" "$profile" || fail "could not atomically update shell profile '$profile'"
+    PATH_PROFILE_TMP=''
     CURRENT_PATH_SHELL=none
     CURRENT_PATH_FILE=''
     CURRENT_PATH_HASH=''
 }
 
+snapshot_path_profile() {
+    profile=$1
+    PATH_SNAPSHOT_FILE="$TMP_DIR/path-profile.snapshot"
+    PATH_SNAPSHOT_PROFILE=$profile
+    PATH_SNAPSHOT_EXISTS=0
+    if [ -e "$profile" ] || [ -L "$profile" ]; then
+        [ -f "$profile" ] && [ ! -L "$profile" ] || fail "shell profile '$profile' is not a regular file"
+        cp -p "$profile" "$PATH_SNAPSHOT_FILE" || fail "could not snapshot shell profile '$profile'"
+        PATH_SNAPSHOT_EXISTS=1
+    fi
+}
+
+restore_path_profile_snapshot() {
+    [ -n "$PATH_SNAPSHOT_FILE" ] || return 0
+    if [ "$PATH_SNAPSHOT_EXISTS" -eq 1 ]; then
+        cp -p "$PATH_SNAPSHOT_FILE" "$PATH_SNAPSHOT_PROFILE" ||
+            fail "could not restore shell profile '$PATH_SNAPSHOT_PROFILE'"
+    else
+        rm -f "$PATH_SNAPSHOT_PROFILE" || fail "could not remove incomplete shell profile '$PATH_SNAPSHOT_PROFILE'"
+    fi
+    PATH_SNAPSHOT_FILE=''
+    PATH_SNAPSHOT_PROFILE=''
+}
+
 write_state_contents() {
     state_tmp=$1
-    {
+    if ! {
         printf 'format_version=%s\n' "$FORMAT_VERSION"
         printf 'installed_version=%s\n' "$2"
         printf 'asset_filename=%s\n' "$3"
@@ -540,30 +659,43 @@ write_state_contents() {
         printf 'path_shell=%s\n' "$5"
         printf 'path_file=%s\n' "$6"
         printf 'path_block_sha256=%s\n' "$7"
-    } > "$state_tmp"
+    } > "$state_tmp"; then
+        return 1
+    fi
     chmod 600 "$state_tmp"
 }
 
 write_state() {
     STATE_TMP_FILE="$INSTALL_DIR/.gitler-state.tmp.$$"
     if [ -e "$STATE_TMP_FILE" ] || [ -L "$STATE_TMP_FILE" ]; then
-        fail 'another installation appears to be updating state'
+        STATE_TMP_FILE=''
+        return 1
     fi
-    write_state_contents "$STATE_TMP_FILE" "$@"
+    if ! write_state_contents "$STATE_TMP_FILE" "$@"; then
+        rm -f "$STATE_TMP_FILE"
+        STATE_TMP_FILE=''
+        return 1
+    fi
     if ! mv -f "$STATE_TMP_FILE" "$STATE_PATH"; then
         rm -f "$STATE_TMP_FILE"
         STATE_TMP_FILE=''
-        fail 'installer state update failed'
+        return 1
     fi
     STATE_TMP_FILE=''
+    return 0
 }
 
 prepare_state() {
     STATE_TMP_FILE="$INSTALL_DIR/.gitler-state.tmp.$$"
     if [ -e "$STATE_TMP_FILE" ] || [ -L "$STATE_TMP_FILE" ]; then
+        STATE_TMP_FILE=''
         fail 'another installation appears to be updating state'
     fi
-    write_state_contents "$STATE_TMP_FILE" "$@"
+    if ! write_state_contents "$STATE_TMP_FILE" "$@"; then
+        rm -f "$STATE_TMP_FILE"
+        STATE_TMP_FILE=''
+        fail 'installer state staging failed'
+    fi
 }
 
 commit_prepared_state() {
@@ -681,8 +813,20 @@ if [ "$REMOVE_PATH" -eq 1 ] && [ "$MANAGED_INSTALL" -eq 0 ]; then
     fail '--remove-path requires an existing installer-managed installation'
 fi
 if [ "$REMOVE_PATH" -eq 1 ] && [ "$MANAGED_INSTALL" -eq 1 ]; then
+    old_path_shell=$CURRENT_PATH_SHELL
+    old_path_file=$CURRENT_PATH_FILE
+    old_path_hash=$CURRENT_PATH_HASH
+    snapshot_path_profile "$CURRENT_PATH_FILE"
     remove_path_block
-    write_state "$CURRENT_VERSION" "$CURRENT_ASSET" "$CURRENT_HASH" "$CURRENT_PATH_SHELL" "$CURRENT_PATH_FILE" "$CURRENT_PATH_HASH"
+    if ! write_state "$CURRENT_VERSION" "$CURRENT_ASSET" "$CURRENT_HASH" "$CURRENT_PATH_SHELL" "$CURRENT_PATH_FILE" "$CURRENT_PATH_HASH"; then
+        CURRENT_PATH_SHELL=$old_path_shell
+        CURRENT_PATH_FILE=$old_path_file
+        CURRENT_PATH_HASH=$old_path_hash
+        restore_path_profile_snapshot
+        fail 'installer state update failed; PATH block was restored'
+    fi
+    PATH_SNAPSHOT_FILE=''
+    PATH_SNAPSHOT_PROFILE=''
     printf 'Removed unchanged installer PATH block.\n'
     exit 0
 fi
@@ -731,8 +875,18 @@ if [ "$MANAGED_INSTALL" -eq 1 ]; then
                 *) shell_name=unknown ;;
             esac
             [ "$shell_name" != unknown ] || fail 'unknown shell; PATH profile editing supports Bash, Zsh, and Fish only'
+            path_profile=$(path_profile_for_shell "$shell_name") || fail 'could not resolve shell profile for PATH management'
+            snapshot_path_profile "$path_profile"
             append_path_block "$shell_name"
-            write_state "$CURRENT_VERSION" "$CURRENT_ASSET" "$CURRENT_HASH" "$CURRENT_PATH_SHELL" "$CURRENT_PATH_FILE" "$CURRENT_PATH_HASH"
+            if ! write_state "$CURRENT_VERSION" "$CURRENT_ASSET" "$CURRENT_HASH" "$CURRENT_PATH_SHELL" "$CURRENT_PATH_FILE" "$CURRENT_PATH_HASH"; then
+                CURRENT_PATH_SHELL='none'
+                CURRENT_PATH_FILE=''
+                CURRENT_PATH_HASH=''
+                restore_path_profile_snapshot
+                fail 'installer state update failed; PATH block was restored'
+            fi
+            PATH_SNAPSHOT_FILE=''
+            PATH_SNAPSHOT_PROFILE=''
         fi
         print_path_instructions
         printf 'Existing managed binary already matches this release; no replacement needed.\n'
@@ -754,7 +908,7 @@ fi
 
 STAGE_FILE=$INSTALL_DIR/.gitler-stage.$$
 ROLLBACK_FILE=$INSTALL_DIR/.gitler-rollback.$$
-if [ -e "$STAGE_FILE" ] || [ -e "$ROLLBACK_FILE" ]; then
+if [ -e "$STAGE_FILE" ] || [ -L "$STAGE_FILE" ] || [ -e "$ROLLBACK_FILE" ] || [ -L "$ROLLBACK_FILE" ]; then
     fail 'another installation appears to be in progress'
 fi
 cp "$binary_file" "$STAGE_FILE"
@@ -768,6 +922,7 @@ if [ -f "$BINARY_PATH" ] && [ ! -L "$BINARY_PATH" ]; then
     cp -p "$BINARY_PATH" "$ROLLBACK_FILE"
     had_old=1
 fi
+HAD_OLD_BINARY=$had_old
 
 old_path_shell=$CURRENT_PATH_SHELL
 old_path_file=$CURRENT_PATH_FILE
@@ -779,14 +934,17 @@ if ! mv -f "$STAGE_FILE" "$BINARY_PATH"; then
     fi
     fail 'atomic executable replacement failed; existing executable was preserved'
 fi
+BINARY_SWAP_COMMITTED=1
 if ! commit_prepared_state; then
     if [ "$had_old" -eq 1 ]; then
         mv -f "$ROLLBACK_FILE" "$BINARY_PATH" || true
     else
         rm -f "$BINARY_PATH"
     fi
+    BINARY_SWAP_COMMITTED=0
     fail 'installer state update failed; existing executable was preserved'
 fi
+STATE_COMMIT_DONE=1
 if [ "$had_old" -eq 1 ]; then
     rm -f "$ROLLBACK_FILE"
 fi
@@ -803,8 +961,15 @@ if [ "$MODIFY_PATH" -eq 1 ] && [ "$CURRENT_PATH_SHELL" = none ]; then
         *) shell_name=unknown ;;
     esac
     [ "$shell_name" != unknown ] || fail 'unknown shell; PATH profile editing supports Bash, Zsh, and Fish only'
+    path_profile=$(path_profile_for_shell "$shell_name") || fail 'could not resolve shell profile for PATH management'
+    snapshot_path_profile "$path_profile"
     append_path_block "$shell_name"
-    write_state "$CURRENT_VERSION" "$CURRENT_ASSET" "$CURRENT_HASH" "$CURRENT_PATH_SHELL" "$CURRENT_PATH_FILE" "$CURRENT_PATH_HASH"
+    if ! write_state "$CURRENT_VERSION" "$CURRENT_ASSET" "$CURRENT_HASH" "$CURRENT_PATH_SHELL" "$CURRENT_PATH_FILE" "$CURRENT_PATH_HASH"; then
+        restore_path_profile_snapshot
+        fail 'installer state update failed; PATH block was restored'
+    fi
+    PATH_SNAPSHOT_FILE=''
+    PATH_SNAPSHOT_PROFILE=''
 fi
 
 print_path_instructions

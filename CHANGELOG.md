@@ -4,6 +4,14 @@ All notable changes to `gitler` are documented here.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-08-30
+
+- Fixed PowerShell installer execution through `irm | iex`.
+- Hardened Unix release resolution, path safety, and PATH/state rollback.
+- Validate PowerShell installer syntax and no-write behavior on PowerShell 5.1 and 7+ in CI.
+
+## [0.1.1] - 2026-08-30
+
 - Added the native binary release, installer, checksum, and provenance
   infrastructure described in the release plan.
 - Added security reporting and dual-license distribution files.

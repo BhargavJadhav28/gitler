@@ -1400,9 +1400,11 @@ function Invoke-Uninstall {
             $userPathChanged = $true
         }
 
-        [IO.File]::Delete($executableBackup)
+        # Backup cleanup is post-commit housekeeping. A locked temporary backup
+        # must not turn a completed uninstall into a partial rollback.
+        Remove-KnownFileQuietly -Path $executableBackup
         $executableBackup = $null
-        [IO.File]::Delete($stateBackup)
+        Remove-KnownFileQuietly -Path $stateBackup
         $stateBackup = $null
     }
     catch {
@@ -1607,8 +1609,20 @@ switch ($targetArchitecture.ToUpperInvariant()) {
 }
 
 $operation = if ($Uninstall) { "Uninstall managed gitler files from '$normalizedInstallDirectory'" } else { "Install or update gitler in '$normalizedInstallDirectory'" }
-if (-not $PSCmdlet.ShouldProcess($normalizedInstallDirectory, $operation)) {
-    return
+$shouldProcessCommand = Get-Variable -Name PSCmdlet -ValueOnly -ErrorAction SilentlyContinue
+if ($null -ne $shouldProcessCommand) {
+    if (-not $shouldProcessCommand.ShouldProcess($normalizedInstallDirectory, $operation)) {
+        return
+    }
+}
+else {
+    # `irm ... | iex` evaluates in the caller's scope and has no PSCmdlet.
+    # Preserve no-write behavior when WhatIfPreference was set by the caller.
+    $whatIfPreferenceValue = Get-Variable -Name WhatIfPreference -ValueOnly -ErrorAction SilentlyContinue
+    if ($null -ne $whatIfPreferenceValue -and [bool]$whatIfPreferenceValue) {
+        Write-Output "What if: Performing the operation '$operation' on target '$normalizedInstallDirectory'."
+        return
+    }
 }
 
 if ($Uninstall) {

@@ -46,7 +46,7 @@ while [ "$#" -gt 0 ]; do
 done
 [ -n "$output" ] || exit 2
 case "$url" in
-    *releases/tags/v0.1.0)
+    *releases/latest|*releases/tags/v0.1.0)
         cp "$FIXTURE_DIR/${MOCK_RELEASE_FILE:-release.json}" "$output"
         ;;
     *SHA256SUMS) cp "$FIXTURE_DIR/SHA256SUMS" "$output" ;;
@@ -133,4 +133,27 @@ if PATH="$mock_bin:$PATH" FIXTURE_DIR="$fixture_dir" MOCK_RELEASE_FILE=release-d
     exit 1
 fi
 [ ! -e "$draft_install_dir" ]
+
+latest_install_dir="$temp_dir/latest-install"
+PATH="$mock_bin:$PATH" HOME="$home_dir" SHELL=/bin/bash FIXTURE_DIR="$fixture_dir" \
+    "$repo_root/install.sh" --install-dir "$latest_install_dir" >/dev/null
+test -f "$latest_install_dir/gitler"
+PATH="$mock_bin:$PATH" FIXTURE_DIR="$fixture_dir" \
+    "$repo_root/install.sh" --uninstall --install-dir "$latest_install_dir" >/dev/null
+[ ! -e "$latest_install_dir" ]
+
+real_parent="$temp_dir/real-parent"
+symlink_parent="$temp_dir/symlink-parent"
+mkdir -p "$real_parent"
+ln -s "$real_parent" "$symlink_parent"
+if [ -L "$symlink_parent" ]; then
+    symlink_install_dir="$symlink_parent/install"
+    if PATH="$mock_bin:$PATH" FIXTURE_DIR="$fixture_dir" \
+        "$repo_root/install.sh" --version v0.1.0 --install-dir "$symlink_install_dir" >/dev/null 2>&1; then
+        printf 'symlinked parent install unexpectedly succeeded\n' >&2
+        exit 1
+    fi
+    [ ! -e "$real_parent/install" ]
+fi
+
 printf 'POSIX installer lifecycle fixtures passed.\n'

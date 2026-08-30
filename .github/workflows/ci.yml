@@ -84,6 +84,40 @@ jobs:
             throw "-WhatIf created install directory '$installDir'."
           }
 
+          $pipedInstallRoot = Join-Path $env:RUNNER_TEMP ('gitler-installer-piped-whatif-' + [guid]::NewGuid().ToString('N'))
+          $pipedInstallDir = Join-Path $pipedInstallRoot 'Programs\gitler'
+          $originalLocalAppData = $env:LOCALAPPDATA
+          $env:LOCALAPPDATA = $pipedInstallRoot
+          $WhatIfPreference = $true
+          Get-Content -LiteralPath $installer -Raw | Invoke-Expression
+          $env:LOCALAPPDATA = $originalLocalAppData
+          if (Test-Path -LiteralPath $pipedInstallDir) {
+            throw "Piped installer created install directory '$pipedInstallDir'."
+          }
+
+      - name: Validate Windows PowerShell 5.1 installer
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $tokens = $null
+          $errors = $null
+          $installer = Join-Path $PWD 'install.ps1'
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            $installer,
+            [ref]$tokens,
+            [ref]$errors
+          ) | Out-Null
+          if ($errors.Count -ne 0) {
+            $errors | ForEach-Object { $_.ToString() }
+            exit 1
+          }
+
+          $installDir = Join-Path $env:RUNNER_TEMP ('gitler-installer-ps51-whatif-' + [guid]::NewGuid().ToString('N'))
+          & $installer -Version v0.1.2 -InstallDir $installDir -WhatIf
+          if (Test-Path -LiteralPath $installDir) {
+            throw "PowerShell 5.1 -WhatIf created install directory '$installDir'."
+          }
+
   msrv:
     name: MSRV (Rust 1.88)
     runs-on: ubuntu-24.04
