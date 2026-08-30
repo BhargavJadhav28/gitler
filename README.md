@@ -10,7 +10,7 @@ access, or external runtime.
 
 ### Quick install
 
-Unix:
+Linux or macOS:
 
 ```sh
 curl -fsSL https://github.com/BhargavJadhav28/gitler/releases/latest/download/install.sh | sh
@@ -22,16 +22,40 @@ Windows PowerShell:
 irm https://github.com/BhargavJadhav28/gitler/releases/latest/download/install.ps1 | iex
 ```
 
+### macOS
+
+macOS 11 and newer are fully supported on both Intel (`x86_64`) and Apple
+Silicon (`arm64`). Open **Terminal** and run:
+
+```sh
+curl -fsSL https://github.com/BhargavJadhav28/gitler/releases/latest/download/install.sh | sh
+```
+
+The installer detects the Mac architecture, installs the matching native binary,
+and automatically configures the detected shell profile. macOS normally uses
+zsh, so the PATH block is added to `~/.zshrc`. Open a new Terminal window, or
+run `source ~/.zshrc`, then verify:
+
+```sh
+gitler --version
+gitler --help
+```
+
+The macOS binary is not notarized, so Gatekeeper may show an “unidentified
+developer” warning. Verify the release source and checksum before allowing it;
+do not disable macOS security controls globally.
+
 Normal installs automatically configure PATH when possible:
 
-- Unix adds a managed block to `.bashrc`, `.zshrc`, or the Fish config.
+- Linux adds a managed block to `.bashrc`, `.zshrc`, or the Fish config.
+- macOS adds a managed block to `.zshrc` by default (or the detected shell profile).
 - Windows adds the per-user install directory to User PATH.
 - If PATH cannot be changed, the installer prints copy-paste commands.
 - Open a new terminal, or run the printed command, if `gitler` is not found.
 
 The default install locations are:
 
-- Unix: `${XDG_DATA_HOME:-$HOME/.local/share}/gitler/bin`
+- Linux/macOS: `${XDG_DATA_HOME:-$HOME/.local/share}/gitler/bin`
 - Windows: `%LOCALAPPDATA%\Programs\gitler`
 
 These commands execute code downloaded from the network. Use the inspect-first
@@ -39,7 +63,7 @@ method below when you want to review the installer before running it.
 
 ### Inspect first
 
-Unix:
+Linux or macOS:
 
 ```sh
 mkdir -p "$HOME/Downloads/gitler"
@@ -66,7 +90,7 @@ Get-Content -LiteralPath $installer
 Replace `vX.Y.Z` with a published stable tag. Exact installs avoid the GitHub
 `latest` API lookup.
 
-Unix:
+Linux or macOS:
 
 ```sh
 version=vX.Y.Z
@@ -198,7 +222,8 @@ cargo test --all-features --locked
 cargo build --release --all-features --locked
 ```
 
-See [`docs/architecture.md`](docs/architecture.md) for design details.
+See [`docs/architecture.md`](docs/architecture.md) for design details. Maintainers
+should follow the [`release checklist`](docs/release.md) when publishing a version.
 
 ## License
 
