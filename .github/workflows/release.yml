@@ -264,18 +264,21 @@ jobs:
             *) echo "unexpected macOS architecture: $file_output" >&2; exit 1 ;;
           esac
           deployment_target=$(otool -l "$binary" | awk '
-            /cmd LC_BUILD_VERSION/ { build = 1; macos = 0; next }
-            build && /^Load command/ { build = 0; macos = 0 }
-            build && /platform MACOS/ { macos = 1; next }
-            build && macos && /minos/ { print $2; exit }
-            /cmd LC_VERSION_MIN_MACOSX/ { legacy = 1; next }
-            legacy && /^Load command/ { legacy = 0 }
-            legacy && /version/ { print $2; exit }
+            /^Load command/ { build = 0; legacy = 0 }
+            $1 == "cmd" && $2 == "LC_BUILD_VERSION" { build = 1; legacy = 0; next }
+            $1 == "cmd" && $2 == "LC_VERSION_MIN_MACOSX" { legacy = 1; build = 0; next }
+            build && $1 == "minos" && target == "" { target = $2 }
+            legacy && $1 == "version" && target == "" { target = $2 }
+            END { print target }
           ')
-          test "$deployment_target" = '11.0' || {
-            echo "unexpected macOS deployment target: $deployment_target" >&2
-            exit 1
-          }
+          case "$deployment_target" in
+            11.0|11.0.0) ;;
+            *)
+              echo "unexpected macOS deployment target: $deployment_target" >&2
+              otool -l "$binary" | awk '$1 == "cmd" || $1 == "platform" || $1 == "minos" || $1 == "version"' >&2
+              exit 1
+              ;;
+          esac
           otool -L "$binary" > "$RUNNER_TEMP/otool.txt"
           if ! awk 'NR > 1 { sub(/^[[:space:]]*/, "", $0); sub(/[[:space:]].*$/, "", $0); if ($0 !~ /^\/usr\/lib\// && $0 !~ /^\/System\/Library\//) { print; bad = 1 } } END { exit bad }' "$RUNNER_TEMP/otool.txt"; then
             echo 'macOS binary has a non-system runtime dependency' >&2
