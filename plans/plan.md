@@ -261,9 +261,12 @@ branch. Do not publish directly on tag push.
    build, smoke-test, inspect, and upload one temporary executable each.
 8. Assembly job creates exact seven-file set, produces `SHA256SUMS`, and validates
    all file contract rules.
-9. Draft job attests final assets, creates draft Release, uploads all assets once,
-   downloads draft assets fresh through GitHub API, revalidates names and hashes,
-   and smoke-tests downloaded Linux binary.
+9. Draft job attests final assets, creates draft Release for the existing tag,
+   uploads all assets once, downloads draft assets fresh through GitHub API,
+   revalidates names and hashes, and smoke-tests downloaded Linux binary. When
+   creating a Release for an existing tag, send `tag_name` only; omit
+   `target_commitish` so GitHub does not require workflow-write authorization for
+   a tagged commit that predates later workflow fixes.
 10. After `production` approval, publish complete draft as latest stable release.
 11. Never repair a published release in place. Publish a higher fixed release and
     clear advisory instead.

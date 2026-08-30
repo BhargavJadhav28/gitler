@@ -124,7 +124,6 @@ jobs:
       contents: read
     env:
       VERSION: ${{ needs.preflight.outputs.version }}
-      COMMIT_SHA: ${{ needs.preflight.outputs.commit }}
       TARGET: x86_64-pc-windows-msvc
       RUSTFLAGS: -C target-feature=+crt-static
     steps:
@@ -431,7 +430,6 @@ jobs:
     env:
       RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
       VERSION: ${{ needs.preflight.outputs.version }}
-      COMMIT_SHA: ${{ needs.preflight.outputs.commit }}
       GH_TOKEN: ${{ github.token }}
     outputs:
       release_id: ${{ steps.create-release.outputs.release_id }}
@@ -461,9 +459,10 @@ jobs:
         run: |
           set -euo pipefail
           release_json="$RUNNER_TEMP/release.json"
+          # The tag already exists. Omitting target_commitish avoids requiring
+          # workflow-write authorization when the tag predates workflow fixes.
           gh api --method POST "repos/$GITHUB_REPOSITORY/releases" \
             -f tag_name="$RELEASE_TAG" \
-            -f target_commitish="$COMMIT_SHA" \
             -f name="gitler $RELEASE_TAG" \
             -f body="Native binaries for $RELEASE_TAG. Verify SHA256SUMS and artifact attestations before installation." \
             -F draft=true \
